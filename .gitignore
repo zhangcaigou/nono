@@ -1,0 +1,69 @@
+# Model weights, datasets, and generated experiment output
+/checkpoints/
+/data/
+/results/
+
+# Separately versioned third-party source checkout
+/transformers/
+
+# Documentation and document attachments (source code only repository)
+*.[Mm][Dd]
+*.[Pp][Dd][Ff]
+/src/
+/repro_smoke_input.jsonl
+
+# Secrets and machine-local environment files
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+
+# Runtime state and logs
+/.runtime/
+*.log
+*.pid
+*.out
+
+# Python caches, environments, and packaging output
+**/__pycache__/
+*.py[cod]
+*.pyo
+**/.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+
+# Java / Maven build output
+/java-backend/target/
+/java-backend/target.*/
+**/.mvn/timing.properties
+*.class
+
+# Node / frontend build and test output
+**/node_modules/
+/nono-Frontend/dist/
+**/coverage/
+**/.vite/
+**/.cache/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE and operating-system metadata
+/.vscode/
+**/.idea/
+*.iml
+.DS_Store
+Thumbs.db

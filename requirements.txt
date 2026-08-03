@@ -1,0 +1,9 @@
+arxiv
+flash-attn
+wandb
+rich
+lxml
+beautifulsoup4
+requests
+tqdm
+transformers

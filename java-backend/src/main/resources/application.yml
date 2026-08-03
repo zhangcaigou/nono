@@ -1,0 +1,40 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: pasa-java-backend
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    # Public API contracts use required nullable fields; emit explicit nulls instead of omitting keys.
+    default-property-inclusion: always
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+pasa:
+  model-service-base-url: ${PASA_MODEL_SERVICE_BASE_URL:http://127.0.0.1:8000}
+  internal-token: ${PASA_INTERNAL_TOKEN:}
+  model-read-timeout: ${PASA_MODEL_READ_TIMEOUT:PT30M}
+  scholarly-api-timeout: ${PASA_SCHOLARLY_API_TIMEOUT:PT6S}
+  task-workers: ${PASA_TASK_WORKERS:1}
+  enrichment-enabled: ${PASA_ENRICHMENT_ENABLED:true}
+  enrichment-max-papers: ${PASA_ENRICHMENT_MAX_PAPERS:40}
+  enrichment-concurrency: ${PASA_ENRICHMENT_CONCURRENCY:6}
+  traceability-enabled: ${TRACEABILITY_ENABLED:true}
+  trace-top-n: ${PASA_TRACE_TOP_N:10}
+  trace-cache-ttl: ${PASA_TRACE_CACHE_TTL:PT6H}
+  trace-cache-max-entries: ${PASA_TRACE_CACHE_MAX_ENTRIES:200}
+  trace-fulltext-enabled: ${PASA_TRACE_FULLTEXT_ENABLED:true}
+  trace-fulltext-max-passages: ${PASA_TRACE_FULLTEXT_MAX_PASSAGES:120}
+  semantic-scholar-api-key: ${SEMANTIC_SCHOLAR_API_KEY:}
+  open-alex-api-key: ${OPENALEX_API_KEY:}
+  open-alex-email: ${OPENALEX_EMAIL:}
+  cors-origins: ${PASA_CORS_ORIGINS:http://localhost:3000,http://localhost:5173}
