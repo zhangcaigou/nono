@@ -5,6 +5,7 @@ import com.pasa.server.error.ApiException;
 import com.pasa.server.model.ModelGateway;
 import com.pasa.server.model.ModelModels;
 import com.pasa.server.model.ModelServiceException;
+import com.pasa.server.deepseek.DeepSeekEvidenceGenerator;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,13 +31,16 @@ public class SearchTaskService {
     private final ModelGateway modelGateway;
     private final Executor executor;
     private final PaperTraceabilityService traceabilityService;
+    private final DeepSeekEvidenceGenerator deepSeekEvidenceGenerator;
 
     public SearchTaskService(ModelGateway modelGateway,
                              @Qualifier("searchTaskExecutor") Executor executor,
-                             PaperTraceabilityService traceabilityService) {
+                             PaperTraceabilityService traceabilityService,
+                             DeepSeekEvidenceGenerator deepSeekEvidenceGenerator) {
         this.modelGateway = modelGateway;
         this.executor = executor;
         this.traceabilityService = traceabilityService;
+        this.deepSeekEvidenceGenerator = deepSeekEvidenceGenerator;
     }
 
     public ApiModels.TaskAccepted create(ApiModels.CreateSearchTaskRequest request) {
@@ -92,6 +96,19 @@ public class SearchTaskService {
                         exception);
                 traceable = PaperTraceabilityService.degraded(papers);
             }
+            List<ApiModels.QueryConstraint> constraints = traceable.constraints().isEmpty()
+                    && deepSeekEvidenceGenerator.isEnabled()
+                    ? new QueryConstraintParser().parse(task.request.query(), task.request.endDate())
+                    : traceable.constraints();
+            DeepSeekEvidenceGenerator.BatchResult deepSeek;
+            try {
+                deepSeek = deepSeekEvidenceGenerator.enrich(
+                        task.request.query(), constraints, traceable.papers());
+            } catch (Exception exception) {
+                log.warn("DeepSeek evidence enrichment failed for task {}; preserving Selector results", taskId,
+                        exception);
+                deepSeek = deepSeekEvidenceGenerator.degraded(traceable.papers());
+            }
             synchronized (task) {
                 if (task.cancelRequested) {
                     markCancelled(task);
@@ -100,12 +117,14 @@ public class SearchTaskService {
                 task.result = new ApiModels.TaskResult(
                         task.taskId,
                         task.request.query(),
-                        traceable.constraints(),
+                        constraints,
                         traceable.enabled(),
-                        traceable.papers(),
+                        deepSeek.papers(),
                         traceable.relations(),
                         response.tree(),
-                        resultSummary(traceable)
+                        resultSummary(traceable),
+                        response.analysis(),
+                        deepSeek.usage()
                 );
                 task.progress = completedProgress(task, response);
                 task.status = TaskState.Status.SUCCEEDED;
@@ -222,9 +241,11 @@ public class SearchTaskService {
             if (task.status != TaskState.Status.RUNNING || task.cancelRequested) {
                 return;
             }
-            task.stage = "loading".equals(progress.stage())
-                    ? TaskState.Stage.LOADING
-                    : TaskState.Stage.SEARCHING;
+            task.stage = switch (progress.stage()) {
+                case "loading" -> TaskState.Stage.LOADING;
+                case "analyzing" -> TaskState.Stage.ENRICHING;
+                default -> TaskState.Stage.SEARCHING;
+            };
             int totalLayers = progress.totalLayers() > 0
                     ? progress.totalLayers()
                     : task.progress.totalLayers();
@@ -255,19 +276,16 @@ public class SearchTaskService {
     }
 
     private static ApiModels.PaperItem withPublicationYearFallback(ApiModels.PaperItem paper) {
-        if (paper.publicationYear() != null) {
-            return paper;
-        }
-        Integer inferredYear = inferPublicationYear(paper.arxivId());
-        if (inferredYear == null) {
-            return paper;
-        }
+        Integer inferredYear = paper.publicationYear() != null
+                ? paper.publicationYear() : inferPublicationYear(paper.arxivId());
         return new ApiModels.PaperItem(
                 paper.paperId(), paper.arxivId(), paper.openalexId(), paper.doi(),
                 paper.title(), paper.abstractText(), paper.score(), paper.selected(), paper.depth(),
                 paper.source(), paper.arxivUrl(), paper.url(), inferredYear, paper.publicationDate(),
                 paper.venue(), paper.citedByCount(), paper.authors(), paper.retrievalProviders(),
-                paper.abstractStatus(), paper.abstractSource(), paper.abstractSourceUrl(), paper.recommendationTrace()
+                paper.abstractStatus(), paper.abstractSource(), paper.abstractSourceUrl(), paper.recommendationTrace(),
+                paper.selectorScore() == null ? paper.score() : paper.selectorScore(), paper.selectorReason(),
+                paper.traceStatus() == null ? "disabled" : paper.traceStatus(), paper.deepseekTrace()
         );
     }
 

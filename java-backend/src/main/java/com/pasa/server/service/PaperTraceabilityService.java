@@ -30,7 +30,9 @@ public interface PaperTraceabilityService {
                 hasAbstract ? paper.abstractText() : "", paper.score(), paper.selected(), paper.depth(), paper.source(),
                 paper.arxivUrl(), paper.url(), paper.publicationYear(), paper.publicationDate(), paper.venue(),
                 paper.citedByCount(), safeList(paper.authors()), safeList(paper.retrievalProviders()),
-                abstractStatus, abstractSource, textOr(paper.abstractSourceUrl(), hasAbstract ? paper.url() : null), null);
+                abstractStatus, abstractSource, textOr(paper.abstractSourceUrl(), hasAbstract ? paper.url() : null), null,
+                paper.selectorScore() == null ? paper.score() : paper.selectorScore(), paper.selectorReason(),
+                paper.traceStatus() == null ? "disabled" : paper.traceStatus(), paper.deepseekTrace());
     }
 
     private static String inferSource(ApiModels.PaperItem paper) {

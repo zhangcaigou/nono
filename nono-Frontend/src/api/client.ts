@@ -4,7 +4,7 @@ import { ApiErrorResponse } from '@/types'
 // 开发模式使用 Vite 代理（同源请求，避免 CORS），生产模式使用完整 URL
 const API_BASE_URL = import.meta.env.DEV
   ? ''
-  : (import.meta.env.VITE_API_BASE_URL || 'http://10.71.199.207:8080')
+  : (import.meta.env.VITE_API_BASE_URL || window.location.origin).replace(/\/+$/, '')
 
 // 创建 axios 实例
 const apiClient: AxiosInstance = axios.create({

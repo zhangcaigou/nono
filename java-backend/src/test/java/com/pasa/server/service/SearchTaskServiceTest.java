@@ -5,6 +5,9 @@ import com.pasa.server.api.ApiModels;
 import com.pasa.server.model.ModelGateway;
 import com.pasa.server.model.ModelModels;
 import com.pasa.server.model.ModelServiceException;
+import com.pasa.server.config.PasaProperties;
+import com.pasa.server.deepseek.DeepSeekEvidenceClient;
+import com.pasa.server.deepseek.DeepSeekEvidenceGenerator;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -28,9 +31,10 @@ class SearchTaskServiceTest {
                         "SearchFrom:mock", "https://arxiv.org/abs/2501.00001",
                         "https://arxiv.org/abs/2501.00001", 2025, "2025-01-01",
                         null, 0, List.of(), List.of("mock"));
+                var analysis = new ObjectMapper().createObjectNode().put("model", "mock-analysis");
                 return new ModelModels.ModelSearchResponse(
                         request.requestId(), request.query(), List.of(paper),
-                        new ObjectMapper().createObjectNode(), new ApiModels.ResultSummary(1, 1));
+                        new ObjectMapper().createObjectNode(), new ApiModels.ResultSummary(1, 1), analysis);
             }
 
             @Override
@@ -39,13 +43,20 @@ class SearchTaskServiceTest {
             }
         };
         Executor directExecutor = Runnable::run;
-        SearchTaskService service = new SearchTaskService(gateway, directExecutor, passThroughTraceability());
+        SearchTaskService service = new SearchTaskService(gateway, directExecutor, passThroughTraceability(), disabledDeepSeek());
 
         ApiModels.TaskAccepted accepted = service.create(new ApiModels.CreateSearchTaskRequest(
                 "find papers", null, null));
 
         assertThat(service.get(accepted.taskId()).status()).isEqualTo("succeeded");
         assertThat(service.result(accepted.taskId()).summary().paperCount()).isEqualTo(1);
+        assertThat(service.result(accepted.taskId()).analysis().path("model").asText()).isEqualTo("mock-analysis");
+        ApiModels.PaperItem resultPaper = service.result(accepted.taskId()).papers().getFirst();
+        assertThat(resultPaper.score()).isEqualTo(0.9);
+        assertThat(resultPaper.selected()).isTrue();
+        assertThat(resultPaper.selectorScore()).isEqualTo(0.9);
+        assertThat(resultPaper.selectorReason()).isNull();
+        assertThat(resultPaper.traceStatus()).isEqualTo("disabled");
     }
 
     @Test
@@ -66,7 +77,7 @@ class SearchTaskServiceTest {
                 return new Readiness(false, "Python 模型服务尚未就绪");
             }
         };
-        SearchTaskService service = new SearchTaskService(gateway, Runnable::run, passThroughTraceability());
+        SearchTaskService service = new SearchTaskService(gateway, Runnable::run, passThroughTraceability(), disabledDeepSeek());
 
         ApiModels.TaskAccepted accepted = service.create(new ApiModels.CreateSearchTaskRequest(
                 "find papers", null, null));
@@ -98,7 +109,7 @@ class SearchTaskServiceTest {
                 return new Readiness(true, null);
             }
         };
-        SearchTaskService service = new SearchTaskService(gateway, Runnable::run, passThroughTraceability());
+        SearchTaskService service = new SearchTaskService(gateway, Runnable::run, passThroughTraceability(), disabledDeepSeek());
 
         ApiModels.TaskAccepted accepted = service.create(new ApiModels.CreateSearchTaskRequest(
                 "find papers", null, null));
@@ -119,7 +130,7 @@ class SearchTaskServiceTest {
         PaperTraceabilityService failingTraceability = (query, endDate, papers) -> {
             throw new IllegalStateException("simulated enrichment failure");
         };
-        SearchTaskService service = new SearchTaskService(gateway, Runnable::run, failingTraceability);
+        SearchTaskService service = new SearchTaskService(gateway, Runnable::run, failingTraceability, disabledDeepSeek());
 
         ApiModels.TaskAccepted accepted = service.create(new ApiModels.CreateSearchTaskRequest(
                 "find papers", null, null));
@@ -157,6 +168,7 @@ class SearchTaskServiceTest {
             ) {
                 progressListener.onProgress(new ModelModels.ModelProgress("selecting", 0, 2, 7, 3));
                 progressListener.onProgress(new ModelModels.ModelProgress("expanding", 1, 2, 11, 5));
+                progressListener.onProgress(new ModelModels.ModelProgress("analyzing", 2, 2, 11, 5));
                 progressSent.countDown();
                 try {
                     if (!allowResult.await(5, TimeUnit.SECONDS)) {
@@ -176,15 +188,15 @@ class SearchTaskServiceTest {
         };
 
         try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
-            SearchTaskService service = new SearchTaskService(gateway, executor, passThroughTraceability());
+            SearchTaskService service = new SearchTaskService(gateway, executor, passThroughTraceability(), disabledDeepSeek());
             ApiModels.TaskAccepted accepted = service.create(new ApiModels.CreateSearchTaskRequest(
                     "find papers", null, new ApiModels.SearchOptions(2, 5, 10, 20)));
 
             assertThat(progressSent.await(5, TimeUnit.SECONDS)).isTrue();
             ApiModels.TaskView running = service.get(accepted.taskId());
             assertThat(running.status()).isEqualTo("running");
-            assertThat(running.stage()).isEqualTo("searching");
-            assertThat(running.progress()).isEqualTo(new ApiModels.TaskProgress(1, 2, 11, 5));
+            assertThat(running.stage()).isEqualTo("enriching");
+            assertThat(running.progress()).isEqualTo(new ApiModels.TaskProgress(2, 2, 11, 5));
 
             allowResult.countDown();
         }
@@ -204,6 +216,15 @@ class SearchTaskServiceTest {
                 return new Readiness(true, null);
             }
         };
+    }
+
+    private static DeepSeekEvidenceGenerator disabledDeepSeek() {
+        PasaProperties properties = new PasaProperties();
+        properties.setDeepseekEvidenceEnabled(false);
+        DeepSeekEvidenceClient client = (system, user) -> {
+            throw new AssertionError("disabled DeepSeek client must not be called");
+        };
+        return new DeepSeekEvidenceGenerator(client, properties, new ObjectMapper());
     }
 
     private static ModelModels.ModelSearchResponse response(

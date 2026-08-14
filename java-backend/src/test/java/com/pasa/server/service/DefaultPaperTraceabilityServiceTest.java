@@ -206,7 +206,7 @@ class DefaultPaperTraceabilityServiceTest {
         assertThat(trace.partiallySatisfiedConstraints()).hasSize(1);
         assertThat(trace.unknownConstraints()).isEmpty();
         assertThat(trace.reasons()).singleElement().satisfies(reason -> {
-            assertThat(reason.text()).startsWith("基于标题与摘要证据，C1：");
+            assertThat(reason.text()).startsWith("《").contains("的标题与摘要证据").contains("C1：");
             assertThat(reason.text()).contains("不依赖全文证据");
             assertThat(reason.text()).doesNotContain("保留候选原文");
         });
@@ -230,7 +230,7 @@ class DefaultPaperTraceabilityServiceTest {
 
         assertThat(trace.unknownConstraints()).hasSize(1);
         assertThat(trace.reasons()).singleElement().satisfies(reason -> {
-            assertThat(reason.text()).startsWith("基于标题与摘要证据，C1：");
+            assertThat(reason.text()).startsWith("《").contains("的标题与摘要证据").contains("C1：");
             assertThat(reason.text()).contains("没有直接支持该项严格要求的表述");
             assertThat(reason.text()).doesNotContain("现有证据不足以作确定判断");
         });

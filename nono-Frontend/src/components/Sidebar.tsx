@@ -35,7 +35,7 @@ export default function Sidebar() {
   const location = useLocation()
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [history, setHistory] = useState<TaskHistoryItem[]>([])
-  const [collapsed, setCollapsed] = useState(false)
+  const [collapsed, setCollapsed] = useState(() => window.innerWidth < 768)
 
   useEffect(() => {
     setHistory(getTaskHistory())

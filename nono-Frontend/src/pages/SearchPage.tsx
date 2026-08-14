@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getHealth, createSearchTask } from '@/api/search'
-import { HealthResponse } from '@/types'
+import { HealthResponse, SearchFormOptions } from '@/types'
 import ChatInput from '@/components/ChatInput'
 import { addTaskToHistory } from '@/components/Sidebar'
 
@@ -29,7 +29,7 @@ export default function SearchPage() {
 
   const isReady = health?.ready ?? false
 
-  const handleSubmit = async (query: string, opts?: any) => {
+  const handleSubmit = async (query: string, opts?: SearchFormOptions) => {
     if (isSubmitting) return
     setIsSubmitting(true)
     setSubmitError('')

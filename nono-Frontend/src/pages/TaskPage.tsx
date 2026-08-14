@@ -11,15 +11,19 @@ import {
   PaperRelation,
   RelationType,
   PaperItem,
+  PaperSemanticAnalysis,
+  SearchAnalysis,
+  SearchFormOptions,
+  DeepSeekTrace,
 } from '@/types'
 import {
   getTask,
   getTaskResult,
   cancelTask,
   createSearchTask,
-  getPaperTrace,
 } from '@/api/search'
-import { stageToChinese, formatTime, calcDuration, scoreToPercent } from '@/utils/format'
+import { stageToChinese, formatTime, calcDuration, formatElapsedDuration, scoreToPercent } from '@/utils/format'
+import { groupDeepSeekResults } from '@/utils/deepseek'
 import ChatInput from '@/components/ChatInput'
 
 // ===== 对话数据结构 =====
@@ -68,6 +72,7 @@ export default function TaskPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const timersRef = useRef<Map<string, number>>(new Map())
+  const activePollsRef = useRef<Set<string>>(new Set())
   const isMountedRef = useRef(true)
   const isNearBottomRef = useRef(true)
   const prevConvLengthRef = useRef(0)
@@ -75,6 +80,8 @@ export default function TaskPage() {
   // ===== 获取任务数据并按需轮询 =====
   const fetchAndPoll = useCallback(async (taskId: string, index: number) => {
     const doFetch = async (): Promise<boolean> => {
+      if (activePollsRef.current.has(taskId)) return false
+      activePollsRef.current.add(taskId)
       try {
         const taskData = await getTask(taskId)
         if (!isMountedRef.current) return true
@@ -87,6 +94,7 @@ export default function TaskPage() {
               task: taskData,
               query: updated[index].query || taskData.query,
               isLoading: false,
+              error: null,
             }
           }
           return updated
@@ -97,7 +105,7 @@ export default function TaskPage() {
         if (isTerminal) {
           const timer = timersRef.current.get(taskId)
           if (timer) {
-            clearInterval(timer)
+            window.clearTimeout(timer)
             timersRef.current.delete(taskId)
           }
 
@@ -112,7 +120,17 @@ export default function TaskPage() {
                 }
                 return updated
               })
-            } catch { /* ignore */ }
+            } catch {
+              if (isMountedRef.current) {
+                setConversation((prev) => {
+                  const updated = [...prev]
+                  if (updated[index]) {
+                    updated[index] = { ...updated[index], error: '结果读取失败，请稍后重试' }
+                  }
+                  return updated
+                })
+              }
+            }
           }
           return true
         }
@@ -129,21 +147,26 @@ export default function TaskPage() {
           })
           return true
         }
+        setConversation((prev) => {
+          const updated = [...prev]
+          if (updated[index]) {
+            updated[index] = { ...updated[index], error: '网络异常，正在自动重试', isLoading: false }
+          }
+          return updated
+        })
         return false
+      } finally {
+        activePollsRef.current.delete(taskId)
       }
     }
 
     const shouldStop = await doFetch()
     if (!shouldStop && isMountedRef.current) {
-      const timer = window.setInterval(async () => {
-        const stop = await doFetch()
-        if (stop) {
-          const t = timersRef.current.get(taskId)
-          if (t) {
-            clearInterval(t)
-            timersRef.current.delete(taskId)
-          }
-        }
+      const previous = timersRef.current.get(taskId)
+      if (previous) window.clearTimeout(previous)
+      const timer = window.setTimeout(() => {
+        timersRef.current.delete(taskId)
+        void fetchAndPoll(taskId, index)
       }, 2000)
       timersRef.current.set(taskId, timer)
     }
@@ -186,10 +209,13 @@ export default function TaskPage() {
 
     setIsPageLoading(false)
 
+    const timers = timersRef.current
+    const activePolls = activePollsRef.current
     return () => {
       isMountedRef.current = false
-      timersRef.current.forEach((t) => clearInterval(t))
-      timersRef.current.clear()
+      timers.forEach((timer) => window.clearTimeout(timer))
+      timers.clear()
+      activePolls.clear()
     }
   }, [urlTaskId, fetchAndPoll])
 
@@ -232,7 +258,7 @@ export default function TaskPage() {
   }, [conversation])
 
   // ===== 追问：在当前对话中追加 =====
-  const handleFollowUp = async (query: string, opts?: any) => {
+  const handleFollowUp = async (query: string, opts?: SearchFormOptions) => {
     if (isSubmitting || !urlTaskId) return
     setIsSubmitting(true)
 
@@ -281,15 +307,38 @@ export default function TaskPage() {
   }
 
   // ===== 重试失败任务 =====
-  const handleRetry = (index: number) => {
+  const handleRetry = async (index: number) => {
     const entry = conversation[index]
     if (!entry) return
-    setConversation((prev) => {
-      const updated = [...prev]
-      updated[index] = { ...updated[index], isLoading: true, error: null }
-      return updated
-    })
-    void fetchAndPoll(entry.taskId, index)
+    const query = entry.query || entry.task?.query
+    if (!query || !urlTaskId) return
+
+    try {
+      const accepted = await createSearchTask({ query })
+      const oldTimer = timersRef.current.get(entry.taskId)
+      if (oldTimer) window.clearTimeout(oldTimer)
+      timersRef.current.delete(entry.taskId)
+      setConversation((prev) => {
+        const updated = [...prev]
+        updated[index] = {
+          taskId: accepted.task_id,
+          query,
+          task: null,
+          result: null,
+          isLoading: true,
+          error: null,
+        }
+        saveConversation(urlTaskId, updated.map((item) => ({ taskId: item.taskId, query: item.query })))
+        return updated
+      })
+      void fetchAndPoll(accepted.task_id, index)
+    } catch {
+      setConversation((prev) => {
+        const updated = [...prev]
+        if (updated[index]) updated[index] = { ...updated[index], error: '重新创建任务失败，请稍后重试' }
+        return updated
+      })
+    }
   }
 
   // ===== Loading =====
@@ -386,7 +435,7 @@ export default function TaskPage() {
           <ChatInput
             onSubmit={handleFollowUp}
             isSubmitting={isSubmitting}
-            placeholder="继续提问..."
+            placeholder="发起新的独立检索..."
             showAdvanced
           />
         </div>
@@ -426,6 +475,38 @@ function ConversationMessage({
   onYearToChange: (val: string) => void
 }) {
   const { task, result, isLoading, error } = entry
+
+  const stageSteps: { key: string; label: string }[] = [
+    { key: 'queued', label: '排队' },
+    { key: 'loading', label: '加载' },
+    { key: 'searching', label: '搜索' },
+    { key: 'enriching', label: '补全' },
+    { key: 'finished', label: '完成' },
+  ]
+  const actualStepIdx = task ? stageSteps.findIndex((step) => step.key === task.stage) : -1
+  const taskStatus = task?.status
+  const [displayedStepIdx, setDisplayedStepIdx] = useState(0)
+  const stageTimerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    if (!taskStatus || actualStepIdx < 0) return
+    if (actualStepIdx <= displayedStepIdx) {
+      if (['succeeded', 'failed', 'cancelled'].includes(taskStatus)) {
+        setDisplayedStepIdx(actualStepIdx)
+      }
+      return
+    }
+
+    // 产品设计：模型搜索阶段较长，前置阶段按 5 秒逐步展示，使整体等待体验更均衡。
+    if (stageTimerRef.current) window.clearTimeout(stageTimerRef.current)
+    stageTimerRef.current = window.setTimeout(() => {
+      setDisplayedStepIdx((previous) => Math.min(previous + 1, actualStepIdx))
+    }, 5000)
+
+    return () => {
+      if (stageTimerRef.current) window.clearTimeout(stageTimerRef.current)
+    }
+  }, [actualStepIdx, displayedStepIdx, taskStatus])
 
   // 加载中
   if (isLoading && !task) {
@@ -477,41 +558,8 @@ function ConversationMessage({
   const isCancelled = task.status === 'cancelled'
   const isSucceeded = task.status === 'succeeded'
 
-  // 阶段步骤（用于步骤指示器）— 平滑过渡，让快速阶段也有视觉停留
-  const stageSteps: { key: string; label: string }[] = [
-    { key: 'queued', label: '排队' },
-    { key: 'loading', label: '加载' },
-    { key: 'searching', label: '搜索' },
-    { key: 'enriching', label: '补全' },
-    { key: 'finished', label: '完成' },
-  ]
-  const actualStepIdx = stageSteps.findIndex((s) => s.key === task.stage)
-
-  // 平滑阶段过渡：让前几个快速阶段至少有视觉停留
-  const [displayedStepIdx, setDisplayedStepIdx] = useState(0)
-  const stageTimerRef = useRef<number | null>(null)
-
-  useEffect(() => {
-    if (actualStepIdx < 0) return
-    if (actualStepIdx <= displayedStepIdx) {
-      // 终态直接跳转
-      const isTerminalStatus = task.status === 'succeeded' || task.status === 'failed' || task.status === 'cancelled'
-      if (isTerminalStatus) setDisplayedStepIdx(actualStepIdx)
-      return
-    }
-
-    // 逐步推进，每步间隔 5 秒：前面的快速阶段（排队/加载）在视觉上充分停留，避免搜索阶段显得过短
-    if (stageTimerRef.current) clearTimeout(stageTimerRef.current)
-    stageTimerRef.current = window.setTimeout(() => {
-      setDisplayedStepIdx((prev) => Math.min(prev + 1, actualStepIdx))
-    }, 5000)
-
-    return () => {
-      if (stageTimerRef.current) clearTimeout(stageTimerRef.current)
-    }
-  }, [actualStepIdx, displayedStepIdx, task.status])
-
   const currentStepIdx = isTerminal ? stageSteps.length - 1 : displayedStepIdx
+  const statisticsPending = task.progress.papers_found === 0 && task.progress.papers_selected === 0
 
   // 筛选论文：入选 + 年份范围
   const filteredPapers = result
@@ -533,6 +581,10 @@ function ConversationMessage({
     }
     return (a.title || '').localeCompare(b.title || '')
   })
+  const semanticRelations = result?.analysis
+    ? toPaperRelations(result.analysis, result.papers)
+    : []
+  const allRelations = result ? dedupePaperRelations([...(result.relations || []), ...semanticRelations]) : []
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -625,8 +677,8 @@ function ConversationMessage({
 
               {/* 实时统计 */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                <StatCard label="已发现论文" value={task.progress.papers_found} color="indigo" />
-                <StatCard label="已选中论文" value={task.progress.papers_selected} color="purple" />
+                <StatCard label="已发现论文" value={statisticsPending ? '统计中' : task.progress.papers_found} color="indigo" />
+                <StatCard label="已选中论文" value={statisticsPending ? '统计中' : task.progress.papers_selected} color="purple" />
                 <StatCard label="扩展层" value={`${task.progress.current_layer}/${task.progress.total_layers}`} color="blue" />
                 <DurationStat startedAt={task.started_at} createdAt={task.created_at} finishedAt={task.finished_at} />
               </div>
@@ -689,12 +741,16 @@ function ConversationMessage({
                     {result.summary.traceable_selected_count > 0 && (
                       <span>可溯源 {result.summary.traceable_selected_count} 篇</span>
                     )}
-                    {result.summary.relation_count > 0 && (
-                      <span>关系 {result.summary.relation_count} 条</span>
+                    {(result.summary.relation_count + (result.analysis?.semantic_relations.length || 0)) > 0 && (
+                      <span>关系 {result.summary.relation_count + (result.analysis?.semantic_relations.length || 0)} 条</span>
                     )}
                   </div>
                 )}
               </div>
+
+              {result.analysis && result.analysis.analyzed_paper_count > 0 && (
+                <SearchAnalysisPanel analysis={result.analysis} papers={result.papers} />
+              )}
 
               {/* 工具栏 */}
               <div className="flex flex-wrap items-center justify-between gap-3 px-1">
@@ -712,18 +768,18 @@ function ConversationMessage({
                   <div className="flex items-center gap-1.5">
                     <input
                       type="number"
-                      placeholder="起始年"
+                      placeholder="起始年份"
                       value={yearFrom}
                       onChange={(e) => onYearFromChange(e.target.value)}
-                      className="w-[72px] border border-gray-200 rounded-lg px-2 py-1 text-xs bg-white text-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400"
+                      className="w-24 border border-gray-200 rounded-lg px-2.5 py-1 text-xs bg-white text-gray-600 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400"
                     />
                     <span className="text-xs text-gray-400">—</span>
                     <input
                       type="number"
-                      placeholder="截止年"
+                      placeholder="截止年份"
                       value={yearTo}
                       onChange={(e) => onYearToChange(e.target.value)}
-                      className="w-[72px] border border-gray-200 rounded-lg px-2 py-1 text-xs bg-white text-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400"
+                      className="w-24 border border-gray-200 rounded-lg px-2.5 py-1 text-xs bg-white text-gray-600 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400"
                     />
                   </div>
                 </div>
@@ -746,15 +802,15 @@ function ConversationMessage({
                 </div>
               ) : (
                 <div
-                  className="relative left-1/2 -translate-x-1/2 px-6"
+                  className="relative left-1/2 -translate-x-1/2 px-2 sm:px-6"
                   style={{ width: chatWidth ? `${chatWidth}px` : '100vw' }}
                 >
                   <PaperResultsPanel
                     papers={sortedPapers}
-                    relations={result.relations || []}
+                    relations={allRelations}
                     allPapers={result.papers}
                     traceabilityEnabled={result.traceability_enabled ?? false}
-                    taskId={entry.taskId}
+                    paperAnalyses={result.analysis?.paper_analyses || []}
                   />
                 </div>
               )}
@@ -803,6 +859,164 @@ function AssistantAvatar() {
   )
 }
 
+function toPaperRelations(analysis: SearchAnalysis, papers: PaperItem[]): PaperRelation[] {
+  const byId = new Map(papers.map((paper) => [paper.paper_id, paper]))
+  return analysis.semantic_relations.flatMap((relation) => {
+    const from = byId.get(relation.from_paper_id)
+    const to = byId.get(relation.to_paper_id)
+    if (!from || !to) return []
+    const evidence: Evidence[] = [
+      {
+        evidence_id: `${relation.relation_id}-E1`,
+        source_type: 'abstract',
+        exact_text: relation.evidence_from,
+        location: 'title or abstract',
+        constraint_ids: [],
+        confidence: relation.confidence,
+        source: from.abstract_source || 'model_result',
+        source_url: from.abstract_source_url || from.url,
+      },
+      {
+        evidence_id: `${relation.relation_id}-E2`,
+        source_type: 'abstract',
+        exact_text: relation.evidence_to,
+        location: 'title or abstract',
+        constraint_ids: [],
+        confidence: relation.confidence,
+        source: to.abstract_source || 'model_result',
+        source_url: to.abstract_source_url || to.url,
+      },
+    ]
+    return [{
+      relation_id: relation.relation_id,
+      from_paper_id: relation.from_paper_id,
+      to_paper_id: relation.to_paper_id,
+      relation_class: 'inferred' as const,
+      type: relation.type,
+      description: relation.description,
+      evidence_ids: evidence.map((item) => item.evidence_id),
+      evidence,
+      confidence: relation.confidence,
+    }]
+  })
+}
+
+function dedupePaperRelations(relations: PaperRelation[]): PaperRelation[] {
+  const unique = new Map<string, PaperRelation>()
+  for (const relation of relations) {
+    const directed = relation.type === 'cites' || relation.type === 'cited_by'
+    const endpoints = directed
+      ? `${relation.from_paper_id}>${relation.to_paper_id}`
+      : [relation.from_paper_id, relation.to_paper_id].sort().join('~')
+    const key = `${relation.type}:${endpoints}`
+    const current = unique.get(key)
+    if (!current
+      || relation.confidence > current.confidence
+      || (relation.relation_class === 'confirmed' && current.relation_class !== 'confirmed')) {
+      unique.set(key, relation)
+    }
+  }
+  return [...unique.values()]
+}
+
+function SearchAnalysisPanel({ analysis, papers }: { analysis: SearchAnalysis; papers: PaperItem[] }) {
+  const synthesis = analysis.synthesis
+  const titleOf = (paperId: string) => papers.find((paper) => paper.paper_id === paperId)?.title || paperId
+  const insightGroups = [
+    { title: '研究共识', values: synthesis.consensus, style: 'bg-emerald-50 border-emerald-100' },
+    { title: '分歧与不确定性', values: synthesis.disagreements, style: 'bg-amber-50 border-amber-100' },
+    { title: '研究空白', values: synthesis.research_gaps, style: 'bg-rose-50 border-rose-100' },
+  ].filter((group) => group.values.length > 0)
+
+  return (
+    <section className="rounded-2xl border border-indigo-100 bg-white shadow-sm overflow-hidden">
+      <div className="bg-gradient-to-r from-indigo-50 to-violet-50 px-5 py-4 border-b border-indigo-100">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="font-semibold text-indigo-900">检索结果综合分析</h3>
+          <span className="text-[11px] text-indigo-500">
+            基于 {analysis.analyzed_paper_count} 篇入选论文 · {analysis.model} · 约 {analysis.estimated_model_calls} 次批量推理
+          </span>
+        </div>
+        {synthesis.direct_answer && (
+          <p className="mt-2 text-sm leading-7 text-gray-800 whitespace-pre-wrap">{synthesis.direct_answer}</p>
+        )}
+        {synthesis.overview && (
+          <p className="mt-2 text-xs leading-6 text-gray-600 whitespace-pre-wrap">{synthesis.overview}</p>
+        )}
+        {analysis.possible_pair_count > 0 && (
+          <p className="mt-1 text-[10px] text-indigo-400">
+            关系候选预筛：{analysis.candidate_pair_count}/{analysis.possible_pair_count} 对进入模型判断
+          </p>
+        )}
+      </div>
+
+      <div className="p-5 space-y-5">
+        {synthesis.themes.length > 0 && (
+          <div>
+            <h4 className="text-xs font-semibold text-gray-700 mb-2">主要研究路线</h4>
+            <div className="grid gap-2 md:grid-cols-2">
+              {synthesis.themes.map((theme) => (
+                <div key={theme.theme_id} className="rounded-xl border border-gray-100 bg-gray-50 p-3">
+                  <p className="text-xs font-semibold text-indigo-700">{theme.name}</p>
+                  <p className="mt-1 text-xs leading-5 text-gray-600">{theme.summary}</p>
+                  {theme.paper_ids.length > 0 && (
+                    <p className="mt-1.5 text-[10px] text-gray-400 line-clamp-2">
+                      代表论文：{theme.paper_ids.map(titleOf).join('；')}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {insightGroups.length > 0 && (
+          <div className="grid gap-2 lg:grid-cols-3">
+            {insightGroups.map((group) => (
+              <div key={group.title} className={`rounded-xl border p-3 ${group.style}`}>
+                <p className="text-xs font-semibold text-gray-700 mb-1.5">{group.title}</p>
+                <ul className="space-y-1 text-[11px] leading-5 text-gray-600">
+                  {group.values.map((value, index) => <li key={index}>• {value}</li>)}
+                </ul>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {analysis.paper_analyses.length > 0 && (
+          <div>
+            <h4 className="text-xs font-semibold text-gray-700 mb-2">论文横向对比</h4>
+            <div className="overflow-x-auto rounded-xl border border-gray-100">
+              <table className="min-w-[900px] w-full text-left text-[11px]">
+                <thead className="bg-gray-50 text-gray-500">
+                  <tr>
+                    <th className="p-2.5 w-52">论文</th>
+                    <th className="p-2.5">方法</th>
+                    <th className="p-2.5">主要发现</th>
+                    <th className="p-2.5">贡献</th>
+                    <th className="p-2.5">局限</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100 align-top text-gray-600">
+                  {analysis.paper_analyses.map((paper) => (
+                    <tr key={paper.paper_id}>
+                      <td className="p-2.5 font-medium text-gray-800">{titleOf(paper.paper_id)}</td>
+                      <td className="p-2.5">{paper.methodology.join('；') || '未确认'}</td>
+                      <td className="p-2.5">{paper.key_findings.join('；') || '未确认'}</td>
+                      <td className="p-2.5">{paper.contributions.join('；') || '未确认'}</td>
+                      <td className="p-2.5">{paper.limitations.join('；') || '未确认'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
 function StatusBadge({ status }: { status: string }) {
   const config: Record<string, { bg: string; text: string; dot: string; label: string }> = {
     running: { bg: 'bg-blue-50', text: 'text-blue-700', dot: 'bg-blue-500', label: '运行中' },
@@ -820,18 +1034,35 @@ function StatusBadge({ status }: { status: string }) {
   )
 }
 
-// 总耗时卡片：任务运行中每秒实时刷新（从 started_at 起算，未开始时从 created_at 起算），终态后定格
+// 运行中使用浏览器本地基线正向累加，避免服务器/客户端时钟偏差导致负数倒计时；终态使用服务端时间戳。
 function DurationStat({ startedAt, createdAt, finishedAt }: { startedAt: string | null; createdAt: string; finishedAt: string | null }) {
   const isDone = !!finishedAt
   const [now, setNow] = useState(() => Date.now())
+  const start = startedAt || createdAt
+  const baselineRef = useRef({ start: '', observedAt: 0, initialElapsed: 0 })
+
+  if (baselineRef.current.start !== start) {
+    const observedAt = Date.now()
+    const serverStart = new Date(start).getTime()
+    baselineRef.current = {
+      start,
+      observedAt,
+      initialElapsed: Number.isFinite(serverStart) ? Math.max(0, observedAt - serverStart) : 0,
+    }
+  }
+
   useEffect(() => {
     if (isDone) return
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [isDone])
-  const start = startedAt || createdAt
-  const end = finishedAt || new Date(now).toISOString()
-  return <StatCard label="总耗时" value={calcDuration(start, end)} color="gray" />
+
+  const value = finishedAt
+    ? calcDuration(start, finishedAt)
+    : formatElapsedDuration(
+        baselineRef.current.initialElapsed + Math.max(0, now - baselineRef.current.observedAt)
+      )
+  return <StatCard label="总耗时" value={value} color="gray" />
 }
 
 function StatCard({ label, value, color }: { label: string; value: string | number; color: string }) {
@@ -855,39 +1086,32 @@ function PaperResultsPanel({
   relations,
   allPapers,
   traceabilityEnabled,
-  taskId,
+  paperAnalyses,
 }: {
   papers: PaperItem[]
   relations: PaperRelation[]
   allPapers: PaperItem[]
   traceabilityEnabled: boolean
-  taskId: string
+  paperAnalyses: PaperSemanticAnalysis[]
 }) {
   const [selectedPaperId, setSelectedPaperId] = useState<string | null>(null)
-  // 全文证据按需加载状态（按 paper_id 隔离）：仅用户主动点击且有 arxiv_id 时才请求
-  const [fulltextState, setFulltextState] = useState<Record<string, {
-    trace: RecommendationTrace | null
-    loaded: boolean
-    loading: boolean
-    error: string | null
-  }>>({})
   // 跳转定位高亮（constraint-xxx / evidence-xxx）
   const [highlightId, setHighlightId] = useState<string | null>(null)
   const highlightTimerRef = useRef<number | null>(null)
 
   const selectedPaper = papers.find((p) => p.paper_id === selectedPaperId) || null
-  // 初始分析不请求全文；全文加载成功后用返回的完整 trace 替换当前 trace
-  const selectedTrace = selectedPaper
-    ? fulltextState[selectedPaper.paper_id]?.trace ?? selectedPaper.recommendation_trace
+  const selectedTrace = selectedPaper?.recommendation_trace ?? null
+  const selectedSemanticAnalysis = selectedPaper
+    ? paperAnalyses.find((analysis) => analysis.paper_id === selectedPaper.paper_id) || null
     : null
 
-  // traceability_enabled === false 时隐藏追溯和关系区域
-  const showSidePanels = traceabilityEnabled && !!selectedPaper
+  const showSidePanels = !!selectedPaper
+    && (traceabilityEnabled || !!selectedSemanticAnalysis || !!selectedPaper.deepseek_trace)
 
   const paperRelations = selectedPaper
-    ? relations.filter(
+    ? dedupePaperRelations(relations.filter(
         (r) => r.from_paper_id === selectedPaper.paper_id || r.to_paper_id === selectedPaper.paper_id
-      )
+      ))
     : []
 
   const findTitle = (paperId: string) => {
@@ -897,26 +1121,6 @@ function PaperResultsPanel({
 
   const handleSelect = (paperId: string) => {
     setSelectedPaperId(selectedPaperId === paperId ? null : paperId)
-  }
-
-  // 仅当论文有可用 arxiv_id 且用户主动点击时才请求全文；成功响应无论是否含 fulltext 证据都静默替换
-  const handleLoadFulltext = async (paperId: string) => {
-    const paper = allPapers.find((p) => p.paper_id === paperId)
-    if (!paper?.arxiv_id?.trim()) return
-    setFulltextState((prev) => ({
-      ...prev,
-      [paperId]: { trace: prev[paperId]?.trace ?? null, loaded: false, loading: true, error: null },
-    }))
-    try {
-      const trace = await getPaperTrace(taskId, paperId, true)
-      setFulltextState((prev) => ({ ...prev, [paperId]: { trace, loaded: true, loading: false, error: null } }))
-    } catch {
-      // 请求失败：保留原 trace，仅在按钮附近显示可重试错误
-      setFulltextState((prev) => ({
-        ...prev,
-        [paperId]: { trace: prev[paperId]?.trace ?? null, loaded: false, loading: false, error: '全文证据加载失败，请稍后重试' },
-      }))
-    }
   }
 
   // 跳转定位：滚动到目标并短暂高亮
@@ -932,11 +1136,11 @@ function PaperResultsPanel({
   }, [])
 
   return (
-    <div className="flex gap-4 items-start justify-center">
+    <div className="flex flex-col 2xl:flex-row gap-4 items-stretch 2xl:items-start justify-center">
       {/* 左栏：相关关系（仅追溯启用且选中论文时显示） */}
       {showSidePanels && (
-        <div className="w-[320px] shrink-0 self-stretch animate-fade-in">
-          <div className="sticky top-4 space-y-3">
+        <div className="order-2 2xl:order-1 w-full 2xl:w-[320px] shrink-0 self-stretch animate-fade-in">
+          <div className="2xl:sticky 2xl:top-4 space-y-3">
             <div className="flex items-center gap-2">
               <svg className="w-4 h-4 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
@@ -944,23 +1148,24 @@ function PaperResultsPanel({
               <span className="text-sm font-bold text-gray-700">相关关系</span>
               <span className="text-[11px] text-gray-400">({paperRelations.length})</span>
             </div>
-            {paperRelations.length === 0 ? (
+            {paperRelations.length === 0 || !selectedPaper ? (
               <div className="text-xs text-gray-400 bg-gray-50 rounded-xl border border-gray-100 p-4 text-center">
                 当前分析范围内未发现关系
               </div>
             ) : (
-              <div className="space-y-2 max-h-[calc(100vh-180px)] overflow-y-auto pr-1">
-                {paperRelations.map((rel) => (
-                  <RelationCard key={rel.relation_id} relation={rel} findTitle={findTitle} />
-                ))}
-              </div>
+              <PaperRelationGraph
+                centerPaperId={selectedPaper.paper_id}
+                relations={paperRelations}
+                findTitle={findTitle}
+                onSelectPaper={setSelectedPaperId}
+              />
             )}
           </div>
         </div>
       )}
 
       {/* 中栏：论文列表（保持后端原始顺序，不因是否有追溯结果而重排） */}
-      <div className="w-full max-w-3xl min-w-0 space-y-3">
+      <div className="order-1 2xl:order-2 w-full max-w-3xl min-w-0 space-y-3 mx-auto">
         {papers.map((paper) => (
           <SelectablePaperCard
             key={paper.paper_id}
@@ -968,6 +1173,7 @@ function PaperResultsPanel({
             isSelected={selectedPaperId === paper.paper_id}
             onSelect={() => handleSelect(paper.paper_id)}
             traceabilityEnabled={traceabilityEnabled}
+            semanticAnalysis={paperAnalyses.find((analysis) => analysis.paper_id === paper.paper_id) || null}
             onNavigateToRef={(targetId) => {
               // 点击卡片理由中的关联标记：选中该论文并定位到右侧面板对应卡片
               setSelectedPaperId(paper.paper_id)
@@ -979,8 +1185,8 @@ function PaperResultsPanel({
 
       {/* 右栏：推荐理由 + 判断依据（仅追溯启用且选中论文时显示） */}
       {showSidePanels && (
-        <div className="w-[360px] shrink-0 self-stretch animate-fade-in">
-          <div className="sticky top-4 space-y-3">
+        <div className="order-3 w-full 2xl:w-[360px] shrink-0 self-stretch animate-fade-in">
+          <div className="2xl:sticky 2xl:top-4 space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <svg className="w-4 h-4 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -998,52 +1204,13 @@ function PaperResultsPanel({
               </button>
             </div>
 
-            <div className="max-h-[calc(100vh-180px)] overflow-y-auto space-y-3 pr-1">
-              {selectedTrace && selectedPaper ? (
+            <div className="2xl:max-h-[calc(100vh-180px)] overflow-y-auto space-y-3 pr-1">
+              {selectedPaper?.deepseek_trace ? (
+                <DeepSeekRecommendationDetail trace={selectedPaper.deepseek_trace} />
+              ) : selectedSemanticAnalysis && selectedPaper ? (
+                <SemanticPaperDetail analysis={selectedSemanticAnalysis} paper={selectedPaper} />
+              ) : selectedTrace && selectedPaper ? (
                 <>
-                  {/* 全文证据按需加载区：canLoadFulltext === false 时不显示按钮，也不显示“全文不可用”提示 */}
-                  {(() => {
-                    const paperId = selectedPaper.paper_id
-                    const ft = fulltextState[paperId]
-                    const canLoadFulltext =
-                      !!selectedPaper.recommendation_trace &&
-                      !!selectedPaper.arxiv_id?.trim() &&
-                      !ft?.loaded
-                    if (ft?.loading) {
-                      return (
-                        <div className="bg-gray-50 border border-gray-100 rounded-xl px-4 py-2.5 flex items-center gap-2">
-                          <svg className="animate-spin w-3.5 h-3.5 text-indigo-500" fill="none" viewBox="0 0 24 24">
-                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                          </svg>
-                          <span className="text-xs text-gray-500">正在加载全文证据...</span>
-                        </div>
-                      )
-                    }
-                    if (!canLoadFulltext && !ft?.error) return null
-                    return (
-                      <div className="space-y-1.5">
-                        {ft?.error && (
-                          <div className="bg-red-50 border border-red-100 rounded-xl px-4 py-2 text-xs text-red-600">
-                            {ft.error}
-                          </div>
-                        )}
-                        {canLoadFulltext && (
-                          <button
-                            onClick={() => handleLoadFulltext(paperId)}
-                            className="w-full bg-white border border-indigo-200 text-indigo-600 hover:bg-indigo-50 rounded-xl px-4 py-2.5 text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
-                          >
-                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
-                            </svg>
-                            加载全文证据
-                          </button>
-                        )}
-                      </div>
-                    )
-                  })()}
-
-                  {/* 追溯详情：理由 + 约束 + 证据 + 检索来源，支持跳转定位 */}
                   <TraceDetail
                     trace={selectedTrace}
                     highlightId={highlightId}
@@ -1070,18 +1237,22 @@ function SelectablePaperCard({
   isSelected,
   onSelect,
   traceabilityEnabled,
+  semanticAnalysis,
   onNavigateToRef,
 }: {
   paper: PaperItem
   isSelected: boolean
   onSelect: () => void
   traceabilityEnabled: boolean
+  semanticAnalysis: PaperSemanticAnalysis | null
   onNavigateToRef?: (targetId: string) => void
 }) {
   const [expanded, setExpanded] = useState(false)
+  const [deepSeekExpanded, setDeepSeekExpanded] = useState(false)
 
   // 四类约束数量（有追溯结果时统计）
   const trace = paper.recommendation_trace
+  const deepSeekTrace = paper.deepseek_trace
   const constraintCounts = trace
     ? [
         { label: '满足', count: trace.satisfied_constraints?.length || 0, cls: 'text-emerald-700 bg-emerald-50 border-emerald-100' },
@@ -1125,7 +1296,7 @@ function SelectablePaperCard({
           <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
             <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />
           </svg>
-          {scoreToPercent(paper.score)}
+          {scoreToPercent(paper.selector_score ?? paper.score)}
         </div>
       </div>
 
@@ -1185,8 +1356,119 @@ function SelectablePaperCard({
         )}
       </div>
 
+      {/* DeepSeek 只解释 Selector 的最终入选结果，不改变 selected/score。 */}
+      {paper.selected && (deepSeekTrace || paper.trace_status) && (
+        <div className="mt-2.5 rounded-lg border border-sky-100 bg-sky-50/60 px-3 py-2 space-y-2" onClick={(e) => e.stopPropagation()}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-semibold text-sky-800">AI 推荐分析</span>
+              {deepSeekTrace && (
+                <span className={`text-[10px] rounded border px-1.5 py-0.5 ${
+                  deepSeekTrace.relevance_level === 'high'
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                    : deepSeekTrace.relevance_level === 'partial'
+                      ? 'border-amber-200 bg-amber-50 text-amber-700'
+                      : 'border-gray-200 bg-gray-50 text-gray-600'
+                }`}>
+                  {deepSeekTrace.relevance_level === 'high' ? '高度相关' : deepSeekTrace.relevance_level === 'partial' ? '部分相关' : '低相关'}
+                </span>
+              )}
+              <span className={`text-[10px] rounded px-1.5 py-0.5 ${
+                paper.trace_status === 'success'
+                  ? 'bg-emerald-100 text-emerald-700'
+                  : paper.trace_status === 'degraded'
+                    ? 'bg-amber-100 text-amber-700'
+                    : 'bg-gray-100 text-gray-500'
+              }`}>
+                {paper.trace_status === 'success' ? 'AI分析完成' : paper.trace_status === 'degraded' ? 'AI暂不可用' : 'AI分析未开启'}
+              </span>
+            </div>
+            {deepSeekTrace && (
+              <button
+                type="button"
+                onClick={() => setDeepSeekExpanded((value) => !value)}
+                className="text-[10px] font-medium text-sky-700 hover:text-sky-900"
+              >
+                {deepSeekExpanded ? '收起证据' : '展开条件与证据'}
+              </button>
+            )}
+          </div>
+
+          <p className="text-[12px] leading-relaxed text-sky-950">
+            {deepSeekTrace?.recommendation_reason
+              || paper.selector_reason
+              || trace?.reasons?.[0]?.text
+              || (paper.trace_status === 'disabled'
+                ? '当前服务未开启 AI 推荐分析；论文仍按原 Selector 结果展示。'
+                : 'AI 分析暂时不可用；论文仍按原 Selector 结果展示。')}
+          </p>
+
+          {deepSeekExpanded && deepSeekTrace && (
+            <div className="space-y-2 border-t border-sky-100 pt-2">
+              {groupDeepSeekResults(deepSeekTrace.constraint_results).map(({ status, label, className, items }) => {
+                if (items.length === 0) return null
+                return (
+                  <section key={status} className={`rounded-md border p-2 ${className}`}>
+                    <p className="text-[10px] font-bold mb-1">{label}</p>
+                    <div className="space-y-1.5">
+                      {items.map((item) => (
+                        <div key={item.constraint_id}>
+                          <p className="text-[11px] leading-relaxed">
+                            <span className="font-mono font-bold">{item.constraint_id}</span> · {item.explanation}
+                          </p>
+                          {item.evidence_ids.length > 0 && (
+                            <p className="text-[10px] opacity-70">证据：{item.evidence_ids.join('、')}</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )
+              })}
+
+              {deepSeekTrace.evidence.length > 0 && (
+                <section>
+                  <p className="mb-1 text-[10px] font-bold text-sky-800">标题和摘要原文证据</p>
+                  <div className="space-y-1.5">
+                    {deepSeekTrace.evidence.map((item) => (
+                      <div key={item.evidence_id} className="rounded-md border border-sky-100 bg-white px-2 py-1.5">
+                        <div className="flex flex-wrap gap-1 text-[10px] text-gray-500">
+                          <span className="font-mono font-bold text-sky-700">{item.evidence_id}</span>
+                          <span>{sourceTypeLabels[item.source_type] || item.source_type}</span>
+                          {item.location.sentence_index != null && <span>句 {item.location.sentence_index}</span>}
+                          {item.location.section && <span>{item.location.section}</span>}
+                          <span>支持 {item.supports_constraints.join('、')}</span>
+                        </div>
+                        <p className="mt-1 text-[11px] leading-relaxed text-gray-700">“{item.exact_text}”</p>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* 推荐理由 + 四类约束数量（仅追溯启用且有追溯结果时显示） */}
-      {traceabilityEnabled && trace && (constraintCounts.length > 0 || (trace.reasons && trace.reasons.length > 0)) && (
+      {!deepSeekTrace && semanticAnalysis && (
+        <div className="mt-2.5 rounded-lg border border-violet-100 bg-violet-50/50 px-3 py-2 space-y-1.5">
+          <p className="text-[12px] leading-relaxed text-violet-900">
+            <span className="font-semibold">论文分析：</span>{semanticAnalysis.one_sentence_summary}
+          </p>
+          {semanticAnalysis.methodology.length > 0 && (
+            <p className="text-[11px] text-violet-700">方法：{semanticAnalysis.methodology.join('、')}</p>
+          )}
+          {semanticAnalysis.key_findings.length > 0 && (
+            <p className="text-[11px] text-gray-600">主要发现：{semanticAnalysis.key_findings.slice(0, 2).join('；')}</p>
+          )}
+          {semanticAnalysis.limitations.length > 0 && (
+            <p className="text-[11px] text-amber-700">局限：{semanticAnalysis.limitations.slice(0, 2).join('；')}</p>
+          )}
+        </div>
+      )}
+
+      {!deepSeekTrace && !semanticAnalysis && traceabilityEnabled && trace && (constraintCounts.length > 0 || (trace.reasons && trace.reasons.length > 0)) && (
         <div className="mt-2.5 bg-indigo-50/50 border border-indigo-100 rounded-lg px-3 py-2 space-y-1.5">
           {constraintCounts.length > 0 && (
             <div className="flex flex-wrap gap-1">
@@ -1283,52 +1565,116 @@ const relationTypeLabels: Record<RelationType, string> = {
   extends_method: '方法扩展',
   same_task: '任务相同',
   same_dataset: '数据集相同',
+  compares_with: '对比研究',
+  contradicts: '结论分歧',
+  survey_of: '综述关系',
 }
 
-// ===== 关系卡片（confirmed 实线 / inferred 虚线；cites 有向 / same_* 无向） =====
-function RelationCard({
-  relation,
+const relationTypeColors: Partial<Record<RelationType, string>> = {
+  cites: '#2563eb',
+  cited_by: '#2563eb',
+  same_method: '#7c3aed',
+  extends_method: '#9333ea',
+  same_task: '#0891b2',
+  same_dataset: '#059669',
+  compares_with: '#d97706',
+  contradicts: '#dc2626',
+  survey_of: '#4f46e5',
+}
+
+// ===== 紧凑论文关系图：中心为当前论文，边缘为去重后的关联论文 =====
+function PaperRelationGraph({
+  centerPaperId,
+  relations,
   findTitle,
+  onSelectPaper,
 }: {
-  relation: PaperRelation
+  centerPaperId: string
+  relations: PaperRelation[]
   findTitle: (id: string) => string
+  onSelectPaper: (paperId: string) => void
 }) {
-  const isDirected = relation.type === 'cites' || relation.type === 'cited_by'
-  const isInferred = relation.relation_class === 'inferred'
+  const strongestByPaper = new Map<string, PaperRelation>()
+  for (const relation of relations) {
+    const otherId = relation.from_paper_id === centerPaperId
+      ? relation.to_paper_id : relation.from_paper_id
+    if (otherId === centerPaperId) continue
+    const current = strongestByPaper.get(otherId)
+    if (!current || relation.confidence > current.confidence) strongestByPaper.set(otherId, relation)
+  }
+  const nodes = [...strongestByPaper.entries()]
+    .sort((left, right) => right[1].confidence - left[1].confidence)
+    .slice(0, 7)
+    .map(([paperId, relation], index, values) => {
+      const angle = -Math.PI / 2 + (Math.PI * 2 * index) / values.length
+      return {
+        paperId,
+        relation,
+        x: 50 + Math.cos(angle) * 37,
+        y: 47 + Math.sin(angle) * 34,
+      }
+    })
+  const legend = [...new Set(nodes.map((node) => node.relation.type))]
 
   return (
-    <div className={`bg-white rounded-xl px-3 py-2.5 text-xs shadow-sm ${
-      isInferred ? 'border border-dashed border-gray-300' : 'border border-gray-100'
-    }`}>
-      <div className="flex items-center justify-between mb-1 gap-1">
-        <div className="flex items-center gap-1 min-w-0">
-          <span className="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0" />
-          <span className="font-semibold text-blue-600 truncate">{relationTypeLabels[relation.type] || relation.type}</span>
-          {isInferred && (
-            <span className="text-[10px] text-gray-400 bg-gray-50 border border-gray-200 rounded px-1 shrink-0">推断</span>
-          )}
+    <div className="rounded-xl border border-slate-100 bg-white p-2 shadow-sm">
+      <div className="relative h-[280px] overflow-hidden rounded-lg bg-gradient-to-br from-slate-50 to-blue-50/50">
+        <svg className="absolute inset-0 h-full w-full" aria-label="论文关系图">
+          <defs>
+            <marker id="relation-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#64748b" />
+            </marker>
+          </defs>
+          {nodes.map((node) => {
+            const directed = node.relation.type === 'cites' || node.relation.type === 'cited_by'
+            return (
+              <line
+                key={`edge-${node.paperId}`}
+                x1="50%" y1="47%" x2={`${node.x}%`} y2={`${node.y}%`}
+                stroke={relationTypeColors[node.relation.type] || '#64748b'}
+                strokeWidth={1.5 + node.relation.confidence * 1.5}
+                strokeOpacity={0.65}
+                strokeDasharray={node.relation.relation_class === 'inferred' ? '5 4' : undefined}
+                markerEnd={directed ? 'url(#relation-arrow)' : undefined}
+              />
+            )
+          })}
+        </svg>
+
+        <div
+          className="absolute left-1/2 top-[47%] z-10 w-24 -translate-x-1/2 -translate-y-1/2 rounded-xl border-2 border-indigo-400 bg-indigo-600 px-2 py-2 text-center text-[10px] font-semibold leading-tight text-white shadow-md"
+          title={findTitle(centerPaperId)}
+        >
+          <span className="line-clamp-3">{findTitle(centerPaperId)}</span>
         </div>
-        {relation.confidence != null && (
-          <span className="text-[10px] font-mono text-gray-400 shrink-0">{Math.round(relation.confidence * 100)}%</span>
+
+        {nodes.map((node) => (
+          <button
+            key={node.paperId}
+            type="button"
+            onClick={() => onSelectPaper(node.paperId)}
+            className="absolute z-10 w-20 -translate-x-1/2 -translate-y-1/2 rounded-lg border border-slate-200 bg-white/95 px-1.5 py-1.5 text-center text-[9px] font-medium leading-tight text-slate-700 shadow-sm transition hover:border-indigo-300 hover:text-indigo-700 hover:shadow"
+            style={{ left: `${node.x}%`, top: `${node.y}%` }}
+            title={`${relationTypeLabels[node.relation.type]} · ${findTitle(node.paperId)}`}
+          >
+            <span className="line-clamp-2">{findTitle(node.paperId)}</span>
+            <span className="mt-0.5 block font-mono text-[8px] text-slate-400">
+              {Math.round(node.relation.confidence * 100)}%
+            </span>
+          </button>
+        ))}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-2 gap-y-1 px-1">
+        {legend.map((type) => (
+          <span key={type} className="inline-flex items-center gap-1 text-[9px] text-slate-500">
+            <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: relationTypeColors[type] || '#64748b' }} />
+            {relationTypeLabels[type] || type}
+          </span>
+        ))}
+        {strongestByPaper.size > nodes.length && (
+          <span className="text-[9px] text-slate-400">另有 {strongestByPaper.size - nodes.length} 篇</span>
         )}
       </div>
-      <p className="text-gray-600 line-clamp-2 font-medium">{findTitle(relation.from_paper_id)}</p>
-      <div className="flex items-center gap-1 my-1 text-blue-400">
-        {isDirected ? (
-          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
-          </svg>
-        ) : (
-          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
-          </svg>
-        )}
-        <span className="text-[10px] text-gray-400">{isDirected ? (relation.type === 'cited_by' ? '被引 →' : '引用 →') : '无向'}</span>
-      </div>
-      <p className="text-gray-600 line-clamp-2 font-medium">{findTitle(relation.to_paper_id)}</p>
-      {relation.description && (
-        <p className="text-gray-400 mt-1.5 text-[11px]">{relation.description}</p>
-      )}
     </div>
   )
 }
@@ -1367,6 +1713,114 @@ function RefChip({ label, onClick }: { label: string; onClick: () => void }) {
     >
       {label}
     </button>
+  )
+}
+
+function DeepSeekRecommendationDetail({ trace }: { trace: DeepSeekTrace }) {
+  const relevanceLabels = { high: '高度相关', partial: '部分相关', low: '低相关' }
+  const groups = groupDeepSeekResults(trace.constraint_results).filter((group) => group.items.length > 0)
+
+  return (
+    <div className="space-y-3">
+      <section className="rounded-xl border border-sky-100 bg-gradient-to-br from-sky-50 to-indigo-50 p-4">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <span className="text-xs font-bold text-sky-800">AI 综合推荐分析</span>
+          <span className="rounded-full border border-sky-200 bg-white px-2 py-0.5 text-[10px] text-sky-700">
+            {relevanceLabels[trace.relevance_level]}
+          </span>
+        </div>
+        <p className="text-[13px] leading-6 text-slate-800">{trace.recommendation_reason}</p>
+      </section>
+
+      <section>
+        <p className="mb-1.5 text-xs font-bold text-slate-500">查询条件核验</p>
+        <div className="flex flex-wrap gap-1.5">
+          {groups.flatMap((group) => group.items.map((item) => (
+            <span key={item.constraint_id} className={`rounded-md border px-2 py-1 text-[10px] ${group.className}`} title={item.explanation}>
+              {item.constraint_id} · {group.label.replace('的条件', '')}
+            </span>
+          )))}
+        </div>
+      </section>
+
+      {trace.evidence.length > 0 && (
+        <section>
+          <p className="mb-1.5 text-xs font-bold text-slate-500">可追溯原文</p>
+          <div className="space-y-1.5">
+            {trace.evidence.map((item) => (
+              <blockquote key={item.evidence_id} className="rounded-lg border border-slate-100 bg-white px-3 py-2 text-[11px] leading-5 text-slate-600 shadow-sm">
+                <div className="mb-1 flex items-center gap-1.5 text-[9px] text-slate-400">
+                  <span className="font-mono text-sky-700">{item.evidence_id}</span>
+                  <span>{sourceTypeLabels[item.source_type] || item.source_type}</span>
+                  <span>→ {item.supports_constraints.join('、')}</span>
+                </div>
+                “{item.exact_text}”
+              </blockquote>
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  )
+}
+
+function SemanticPaperDetail({ analysis, paper }: { analysis: PaperSemanticAnalysis; paper: PaperItem }) {
+  const relevanceLabels = { high: '高度相关', partial: '部分相关', low: '低相关' }
+  const sections = [
+    { title: '采用方法', values: analysis.methodology, style: 'text-violet-700 bg-violet-50 border-violet-100' },
+    { title: '使用数据集', values: analysis.datasets, style: 'text-blue-700 bg-blue-50 border-blue-100' },
+    { title: '主要发现', values: analysis.key_findings, style: 'text-emerald-700 bg-emerald-50 border-emerald-100' },
+    { title: '核心贡献', values: analysis.contributions, style: 'text-indigo-700 bg-indigo-50 border-indigo-100' },
+    { title: '局限性', values: analysis.limitations, style: 'text-amber-700 bg-amber-50 border-amber-100' },
+  ].filter((section) => section.values.length > 0)
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-3.5">
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <span className="text-xs font-bold text-indigo-700">个性化推荐理由</span>
+          <span className="rounded-full border border-indigo-200 bg-white px-2 py-0.5 text-[10px] text-indigo-600">
+            {relevanceLabels[analysis.relevance_level]}
+          </span>
+        </div>
+        <p className="text-xs leading-6 text-indigo-900">{analysis.one_sentence_summary}</p>
+        {analysis.research_problem && (
+          <p className="mt-2 text-[11px] leading-5 text-gray-600">
+            <span className="font-semibold text-gray-700">对应问题：</span>{analysis.research_problem}
+          </p>
+        )}
+      </div>
+
+      {sections.map((section) => (
+        <div key={section.title}>
+          <p className="mb-1.5 text-xs font-bold text-gray-500">{section.title}</p>
+          <div className="space-y-1.5">
+            {section.values.map((value, index) => (
+              <p key={index} className={`rounded-lg border px-3 py-2 text-[11px] leading-5 ${section.style}`}>
+                {value}
+              </p>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      {analysis.evidence.length > 0 && (
+        <div>
+          <p className="mb-1.5 text-xs font-bold text-gray-500">标题或摘要原文证据</p>
+          <div className="space-y-1.5">
+            {analysis.evidence.map((quote, index) => (
+              <blockquote key={index} className="rounded-lg border border-gray-100 bg-gray-50 px-3 py-2 text-[11px] leading-5 text-gray-600">
+                “{quote}”
+              </blockquote>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <p className="text-[10px] text-gray-400">
+        以上分析仅基于《{paper.title}》当前可用的标题和摘要证据。
+      </p>
+    </div>
   )
 }
 

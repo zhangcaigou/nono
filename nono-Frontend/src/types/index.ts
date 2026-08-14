@@ -12,22 +12,29 @@ export interface HealthResponse {
   status: string
   service: string
   ready: boolean
-  model_service_ready?: boolean
+  model_service_ready: boolean
   engine_mode?: string
   environment?: string
   reasons: string[]
 }
 
 // ===== 创建任务 =====
+export interface SearchOptions {
+  expand_layers?: number
+  search_queries?: number
+  search_papers?: number
+  expand_papers?: number
+}
+
+export interface SearchFormOptions {
+  end_date?: string | null
+  options?: SearchOptions
+}
+
 export interface CreateSearchTaskRequest {
   query: string
   end_date?: string | null
-  options?: {
-    expand_layers?: number
-    search_queries?: number
-    search_papers?: number
-    expand_papers?: number
-  }
+  options?: SearchOptions
 }
 
 export interface SearchTaskAccepted {
@@ -69,6 +76,44 @@ export interface QueryConstraint {
   constraint_id: string
   type: ConstraintType
   text: string
+  importance: ConstraintType
+  description: string
+  original_text: string
+}
+
+export interface DeepSeekEvidenceLocation {
+  field: string
+  sentence_index: number | null
+  section: string | null
+  page: number | null
+}
+
+export interface DeepSeekEvidence {
+  evidence_id: string
+  source_type: 'title' | 'abstract' | 'fulltext' | 'metadata'
+  exact_text: string
+  location: DeepSeekEvidenceLocation
+  supports_constraints: string[]
+  confidence: number
+}
+
+export interface DeepSeekConstraintResult {
+  constraint_id: string
+  status: ConstraintStatus
+  explanation: string
+  evidence_ids: string[]
+  confidence: number
+}
+
+export interface DeepSeekTrace {
+  recommendation_reason: string
+  relevance_level: 'high' | 'partial' | 'low'
+  constraint_results: DeepSeekConstraintResult[]
+  evidence: DeepSeekEvidence[]
+  satisfied_constraints: string[]
+  partially_satisfied_constraints: string[]
+  violated_constraints: string[]
+  unknown_constraints: string[]
 }
 
 // ===== 约束评估 =====
@@ -127,6 +172,9 @@ export type RelationType =
   | 'extends_method'
   | 'same_task'
   | 'same_dataset'
+  | 'compares_with'
+  | 'contradicts'
+  | 'survey_of'
 
 export interface PaperRelation {
   relation_id: string
@@ -138,6 +186,72 @@ export interface PaperRelation {
   evidence_ids: string[]
   evidence: Evidence[]
   confidence: number
+}
+
+export interface QueryUnderstanding {
+  research_intent: string
+  entities: string[]
+  methods: string[]
+  domains: string[]
+  datasets: string[]
+  hard_constraints: string[]
+  soft_constraints: string[]
+  exclusions: string[]
+  sub_questions: string[]
+  comparison_dimensions: string[]
+}
+
+export interface PaperSemanticAnalysis {
+  paper_id: string
+  relevance_level: 'high' | 'partial' | 'low'
+  one_sentence_summary: string
+  research_problem: string
+  methodology: string[]
+  datasets: string[]
+  key_findings: string[]
+  contributions: string[]
+  limitations: string[]
+  evidence: string[]
+}
+
+export interface AnalysisTheme {
+  theme_id: string
+  name: string
+  summary: string
+  paper_ids: string[]
+}
+
+export interface SemanticRelation {
+  relation_id: string
+  from_paper_id: string
+  to_paper_id: string
+  relation_class: 'inferred'
+  type: RelationType
+  description: string
+  evidence_from: string
+  evidence_to: string
+  confidence: number
+}
+
+export interface SearchAnalysis {
+  query_understanding: QueryUnderstanding
+  paper_analyses: PaperSemanticAnalysis[]
+  synthesis: {
+    direct_answer: string
+    overview: string
+    themes: AnalysisTheme[]
+    consensus: string[]
+    disagreements: string[]
+    research_gaps: string[]
+    recommended_reading_order: string[]
+    comparison_dimensions: string[]
+  }
+  semantic_relations: SemanticRelation[]
+  analyzed_paper_count: number
+  model: string
+  estimated_model_calls: number
+  candidate_pair_count: number
+  possible_pair_count: number
 }
 
 // ===== 结果 =====
@@ -164,6 +278,10 @@ export interface PaperItem {
   abstract_source: string
   abstract_source_url: string | null
   recommendation_trace: RecommendationTrace | null
+  selector_score: number | null
+  selector_reason: string | null
+  trace_status: 'success' | 'degraded' | 'disabled'
+  deepseek_trace: DeepSeekTrace | null
 }
 
 export interface SearchResult {
@@ -173,6 +291,7 @@ export interface SearchResult {
   traceability_enabled: boolean
   papers: PaperItem[]
   relations: PaperRelation[]
+  analysis: SearchAnalysis | null
   tree: Record<string, unknown>
   summary: {
     paper_count: number
@@ -182,6 +301,14 @@ export interface SearchResult {
     traceable_selected_count: number
     relation_count: number
   }
+  deepseek_usage: {
+    total_calls: number
+    input_tokens: number
+    output_tokens: number
+    cache_hits: number
+    degraded_papers: number
+    model_name: string
+  } | null
 }
 
 // ===== 统一错误响应 =====

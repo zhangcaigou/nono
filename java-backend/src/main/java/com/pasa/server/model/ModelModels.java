@@ -22,8 +22,14 @@ public final class ModelModels {
             String query,
             List<ApiModels.PaperItem> papers,
             JsonNode tree,
-            ApiModels.ResultSummary summary
-    ) {}
+            ApiModels.ResultSummary summary,
+            JsonNode analysis
+    ) {
+        public ModelSearchResponse(String requestId, String query, List<ApiModels.PaperItem> papers,
+                                   JsonNode tree, ApiModels.ResultSummary summary) {
+            this(requestId, query, papers, tree, summary, null);
+        }
+    }
 
     public record ModelProgress(
             String stage,

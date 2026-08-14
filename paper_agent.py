@@ -45,6 +45,7 @@ class PaperAgent:
         search_papers:  int = 10, # per query
         expand_papers:  int = 20, # per layer
         threads_num:    int = 20, # number of threads in parallel at the same time
+        progress_callback = None, # optional (papers_found, papers_selected) callback
     ) -> None:
         self.crawler    = crawler
         self.selector   = selector
@@ -79,6 +80,7 @@ class PaperAgent:
         self.search_papers   = search_papers
         self.expand_papers   = expand_papers
         self.threads_num     = threads_num
+        self.progress_callback = progress_callback
         self.papers_queue    = []
         self.expand_start    = 0
         self.lock            = threading.Lock()
@@ -154,9 +156,12 @@ class PaperAgent:
                 })
 
     def search_paper(self, queries):
-        while queries:
+        while True:
             with self.lock:
-                query, self.root.child[query] = queries.pop(), []
+                if not queries:
+                    return
+                query = queries.pop()
+                self.root.child[query] = []
 
             serper_ids, openalex_papers = [], []
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -223,20 +228,39 @@ class PaperAgent:
                     self.root.child[query].append(paper_node)
                     self.papers_queue.append(paper_node)
 
+                if self.progress_callback is not None:
+                    papers = [
+                        paper
+                        for query_papers in self.root.child.values()
+                        for paper in query_papers
+                    ]
+                    self.progress_callback(
+                        len(papers),
+                        sum(paper.select_score > 0.5 for paper in papers),
+                    )
+
     def search(self):
         prompt = self.prompts["generate_query"].format(user_query=self.user_query).strip()
-        queries = self.crawler.infer(prompt)
-        queries = [q.strip() for q in re.findall(self.templates["search_template"], queries, flags=re.DOTALL)][:self.search_queries]
+        response = self.crawler.infer(prompt)
+        parsed = [
+            query.strip()
+            for query in re.findall(self.templates["search_template"], response, flags=re.DOTALL)
+            if query.strip()
+        ]
+        queries = list(dict.fromkeys(parsed))[:self.search_queries]
+        if not queries:
+            raise RuntimeError("Crawler did not generate any valid search query")
         self.root.extra["generated_search_queries"] = list(queries)
+        if self.progress_callback is not None:
+            self.progress_callback(0, 0)
         PaperAgent.do_parallel(self.search_paper, (queries,), len(queries))
 
     def get_paper_content(self, new_expand, crawl_prompts, have_full_paper):
-        while new_expand:
+        while True:
             with self.lock:
-                if new_expand:
-                    paper = new_expand.pop(0)
-                else:
-                    break
+                if not new_expand:
+                    return
+                paper = new_expand.pop(0)
             
             if paper.sections == "":
                 if not paper.arxiv_id:
@@ -254,12 +278,11 @@ class PaperAgent:
                 crawl_prompts.append(prompt)
 
     def search_ref(self, section_sources_ori, select_prompts, section_sources, lock):
-        while section_sources_ori:
+        while True:
             with lock:
-                if section_sources_ori:
-                    section, title = section_sources_ori.pop(0)
-                else:
-                    break
+                if not section_sources_ori:
+                    return
+                section, title = section_sources_ori.pop(0)
             
             searched_paper = search_paper_by_title(title)
             if searched_paper is None:
@@ -278,13 +301,14 @@ class PaperAgent:
                 section_sources.append([section, searched_paper])
 
     def do_expand(self, depth, have_full_paper, crawl_results):
-        while have_full_paper:
+        while True:
             with self.lock:
-                if have_full_paper:
-                    paper = have_full_paper.pop(0)
-                    crawl_result = crawl_results.pop(0)
-                else:
-                    break
+                if not have_full_paper:
+                    return
+                if not crawl_results:
+                    raise RuntimeError("Crawler expansion results do not match loaded papers")
+                paper = have_full_paper.pop(0)
+                crawl_result = crawl_results.pop(0)
             crawl_result = re.findall(self.templates["expand_template"], crawl_result, flags=re.DOTALL)
             section_sources_ori = []
             for section in crawl_result:

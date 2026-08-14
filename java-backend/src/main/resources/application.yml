@@ -34,6 +34,17 @@ pasa:
   trace-cache-max-entries: ${PASA_TRACE_CACHE_MAX_ENTRIES:200}
   trace-fulltext-enabled: ${PASA_TRACE_FULLTEXT_ENABLED:true}
   trace-fulltext-max-passages: ${PASA_TRACE_FULLTEXT_MAX_PASSAGES:120}
+  deepseek-api-key: ${DEEPSEEK_API_KEY:}
+  deepseek-base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+  deepseek-model: ${DEEPSEEK_MODEL:deepseek-v4-flash}
+  deepseek-evidence-enabled: ${DEEPSEEK_EVIDENCE_ENABLED:true}
+  deepseek-timeout: ${DEEPSEEK_TIMEOUT:60}
+  deepseek-max-retries: ${DEEPSEEK_MAX_RETRIES:2}
+  deepseek-max-papers: ${DEEPSEEK_MAX_PAPERS:20}
+  deepseek-fulltext-enabled: ${DEEPSEEK_FULLTEXT_ENABLED:false}
+  deepseek-concurrency: ${DEEPSEEK_CONCURRENCY:4}
+  deepseek-cache-max-entries: ${DEEPSEEK_CACHE_MAX_ENTRIES:1000}
+  deepseek-prompt-version: ${DEEPSEEK_PROMPT_VERSION:evidence-v2}
   semantic-scholar-api-key: ${SEMANTIC_SCHOLAR_API_KEY:}
   open-alex-api-key: ${OPENALEX_API_KEY:}
   open-alex-email: ${OPENALEX_EMAIL:}

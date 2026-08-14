@@ -20,7 +20,7 @@ from backend.errors import (
     validation_error_handler,
 )
 from backend.result_formatter import format_result
-from backend.schemas import ErrorResponse, HealthResponse, ModelSearchRequest, ModelSearchResponse, TaskProgress
+from backend.schemas import ErrorResponse, HealthResponse, ModelSearchRequest, ModelSearchResponse, TaskProgress, TaskStage
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -98,7 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise ApiError(503, exc.code, "PaSa 模型不可用") from exc
             except EngineError as exc:
                 raise ApiError(502, exc.code, "PaSa 论文检索执行失败") from exc
-            return format_result(payload.request_id, payload.query, tree)
+            result = format_result(payload.request_id, payload.query, tree)
+            return result.model_copy(update={"analysis": engine.analyze(payload, result)})
         finally:
             inference_slots.release()
 
@@ -131,6 +132,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 tree = engine.run(payload, publish_progress)
                 result = format_result(payload.request_id, payload.query, tree)
+                publish_progress(TaskStage.ANALYZING, TaskProgress(
+                    current_layer=payload.options.expand_layers,
+                    total_layers=payload.options.expand_layers,
+                    papers_found=result.summary.paper_count,
+                    papers_selected=result.summary.selected_count,
+                ))
+                result = result.model_copy(update={"analysis": engine.analyze(payload, result)})
                 events.put({"type": "result", "data": result.model_dump(mode="json")})
             except ModelUnavailableError as exc:
                 events.put({"type": "error", "error": {

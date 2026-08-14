@@ -48,7 +48,7 @@ class Agent:
         probs = outputs.scores[0].softmax(dim=-1)[:, true_token_id].cpu().numpy().tolist()
         return probs
 
-    def infer(self, prompt, sample=False):
+    def infer(self, prompt, sample=False, max_new_tokens=512):
         text = self.tokenizer.apply_chat_template(
             [{
                 "content": prompt.strip(),
@@ -71,7 +71,7 @@ class Agent:
 
         generated_ids = self.model.generate(
             **model_inputs,
-            max_new_tokens=512
+            max_new_tokens=max_new_tokens
         )
         generated_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
@@ -80,7 +80,7 @@ class Agent:
         response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
         return response
     
-    def batch_infer(self, prompts, batch_size=8, sample=False):
+    def batch_infer(self, prompts, batch_size=8, sample=False, max_new_tokens=512):
         if len(prompts) == 0:
             return []
         texts = [self.tokenizer.apply_chat_template(
@@ -106,7 +106,7 @@ class Agent:
                 model_inputs["top_k"] = None
             generated_ids = self.model.generate(
                 **model_inputs,
-                max_new_tokens=512
+                max_new_tokens=max_new_tokens
             )
             generated_ids = [
                 output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)

@@ -1,0 +1,449 @@
+package com.pasa.server.deepseek;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.pasa.server.api.ApiModels;
+import com.pasa.server.config.PasaProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+
+@Service
+public class DeepSeekEvidenceGenerator {
+    private static final Logger log = LoggerFactory.getLogger(DeepSeekEvidenceGenerator.class);
+    private static final Set<String> STATUSES = Set.of(
+            "satisfied", "partially_satisfied", "violated", "unknown");
+    private static final Set<String> RELEVANCE = Set.of("high", "partial", "low");
+    private static final Set<String> SOURCE_TYPES = Set.of("title", "abstract", "metadata", "fulltext");
+
+    private final DeepSeekEvidenceClient client;
+    private final PasaProperties properties;
+    private final ObjectMapper objectMapper;
+    private final String systemPrompt;
+    private final Semaphore apiSlots;
+    private final Map<String, ApiModels.DeepSeekTrace> cache = new ConcurrentHashMap<>();
+
+    @Autowired
+    public DeepSeekEvidenceGenerator(
+            DeepSeekEvidenceClient client,
+            PasaProperties properties,
+            ObjectMapper objectMapper
+    ) {
+        this(client, properties, objectMapper, loadPrompt(properties.getDeepseekPromptVersion()));
+    }
+
+    DeepSeekEvidenceGenerator(
+            DeepSeekEvidenceClient client,
+            PasaProperties properties,
+            ObjectMapper objectMapper,
+            String systemPrompt
+    ) {
+        this.client = client;
+        this.properties = properties;
+        this.objectMapper = objectMapper;
+        this.systemPrompt = systemPrompt;
+        this.apiSlots = new Semaphore(properties.getDeepseekConcurrency());
+    }
+
+    public BatchResult enrich(
+            String originalQuery,
+            List<ApiModels.QueryConstraint> constraints,
+            List<ApiModels.PaperItem> papers
+    ) {
+        if (!available()) {
+            return new BatchResult(papers.stream().map(paper -> withTrace(paper, "disabled", null)).toList(),
+                    new ApiModels.DeepSeekUsageStats(0, 0, 0, 0, 0, properties.getDeepseekModel()));
+        }
+
+        List<ApiModels.PaperItem> targets = papers.stream()
+                .filter(ApiModels.PaperItem::selected)
+                .limit(properties.getDeepseekMaxPapers())
+                .toList();
+        if (targets.isEmpty()) {
+            return new BatchResult(papers.stream().map(paper -> withTrace(paper, "disabled", null)).toList(),
+                    new ApiModels.DeepSeekUsageStats(0, 0, 0, 0, 0, properties.getDeepseekModel()));
+        }
+
+        Map<String, Outcome> outcomes = new HashMap<>();
+        int concurrency = Math.min(properties.getDeepseekConcurrency(), targets.size());
+        try (var executor = Executors.newFixedThreadPool(concurrency,
+                Thread.ofVirtual().name("pasa-deepseek-evidence-", 0).factory())) {
+            Map<String, Future<Outcome>> futures = new LinkedHashMap<>();
+            for (ApiModels.PaperItem paper : targets) {
+                futures.put(paper.paperId(), executor.submit(() -> analyze(originalQuery, constraints, paper)));
+            }
+            futures.forEach((paperId, future) -> {
+                try {
+                    outcomes.put(paperId, future.get());
+                } catch (Exception exception) {
+                    log.warn("DeepSeek evidence task failed for paper {}: {}", paperId,
+                            exception.getClass().getSimpleName());
+                    outcomes.put(paperId, Outcome.degraded(properties.getDeepseekModel(), 0));
+                }
+            });
+        }
+
+        List<ApiModels.PaperItem> result = papers.stream().map(paper -> {
+            Outcome outcome = outcomes.get(paper.paperId());
+            return outcome == null
+                    ? withTrace(paper, "disabled", null)
+                    : withTrace(paper, outcome.status(), outcome.trace());
+        }).toList();
+        long calls = outcomes.values().stream().mapToLong(Outcome::calls).sum();
+        long inputTokens = outcomes.values().stream().mapToLong(Outcome::inputTokens).sum();
+        long outputTokens = outcomes.values().stream().mapToLong(Outcome::outputTokens).sum();
+        long cacheHits = outcomes.values().stream().filter(Outcome::cacheHit).count();
+        long degraded = outcomes.values().stream().filter(value -> "degraded".equals(value.status())).count();
+        String modelName = outcomes.values().stream().map(Outcome::modelName)
+                .filter(value -> value != null && !value.isBlank()).findFirst()
+                .orElse(properties.getDeepseekModel());
+        return new BatchResult(result, new ApiModels.DeepSeekUsageStats(
+                calls, inputTokens, outputTokens, cacheHits, degraded, modelName));
+    }
+
+    public BatchResult degraded(List<ApiModels.PaperItem> papers) {
+        long degraded = papers.stream().filter(ApiModels.PaperItem::selected).count();
+        List<ApiModels.PaperItem> result = papers.stream()
+                .map(paper -> withTrace(paper, paper.selected() ? "degraded" : "disabled", null))
+                .toList();
+        return new BatchResult(result, new ApiModels.DeepSeekUsageStats(
+                0, 0, 0, 0, degraded, properties.getDeepseekModel()));
+    }
+
+    private boolean available() {
+        return properties.isDeepseekEvidenceEnabled()
+                && properties.getDeepseekMaxPapers() > 0
+                && !properties.getDeepseekApiKey().isBlank();
+    }
+
+    public boolean isEnabled() {
+        return available();
+    }
+
+    private Outcome analyze(
+            String originalQuery,
+            List<ApiModels.QueryConstraint> constraints,
+            ApiModels.PaperItem paper
+    ) {
+        String key = cacheKey(originalQuery, paper.paperId(), properties.getDeepseekPromptVersion());
+        ApiModels.DeepSeekTrace cached = cache.get(key);
+        if (cached != null) {
+            log.info("DeepSeek evidence paper={} model={} cache_hit=true", paper.paperId(),
+                    properties.getDeepseekModel());
+            return new Outcome("success", cached, 0, 0, 0, 0, true, properties.getDeepseekModel());
+        }
+
+        String userPrompt = buildUserPrompt(originalQuery, constraints, paper);
+        int maxAttempts = properties.getDeepseekMaxRetries() + 1;
+        long inputTokens = 0;
+        long outputTokens = 0;
+        int invalidResponseFailures = 0;
+        Instant started = Instant.now();
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                DeepSeekEvidenceClient.Completion completion;
+                apiSlots.acquire();
+                try {
+                    completion = client.complete(systemPrompt, userPrompt);
+                } finally {
+                    apiSlots.release();
+                }
+                inputTokens += completion.inputTokens();
+                outputTokens += completion.outputTokens();
+                ApiModels.DeepSeekTrace parsed = objectMapper.readValue(
+                        completion.content(), ApiModels.DeepSeekTrace.class);
+                ApiModels.DeepSeekTrace validated = validate(parsed, constraints, paper);
+                putCache(key, validated);
+                long latency = Duration.between(started, Instant.now()).toMillis();
+                log.info("DeepSeek evidence paper={} model={} input_tokens={} output_tokens={} latency_ms={} retries={} cache_hit=false",
+                        paper.paperId(), completion.modelName(), inputTokens, outputTokens, latency, attempt - 1);
+                return new Outcome("success", validated, attempt, inputTokens, outputTokens,
+                        attempt - 1, false, completion.modelName());
+            } catch (Exception exception) {
+                if (exception instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                boolean invalidResponse = exception instanceof JsonProcessingException
+                        || exception instanceof IllegalArgumentException;
+                if (invalidResponse) {
+                    invalidResponseFailures++;
+                }
+                // Malformed/schema-invalid JSON is retried once; transport/API errors use MAX_RETRIES.
+                if ((invalidResponse && invalidResponseFailures >= 2) || attempt == maxAttempts) {
+                    long latency = Duration.between(started, Instant.now()).toMillis();
+                    log.warn("DeepSeek evidence degraded paper={} model={} latency_ms={} retries={} cause={}",
+                            paper.paperId(), properties.getDeepseekModel(), latency, attempt - 1,
+                            exception.getClass().getSimpleName());
+                    return new Outcome("degraded", null, attempt, inputTokens, outputTokens,
+                            attempt - 1, false, properties.getDeepseekModel());
+                }
+            }
+        }
+        return Outcome.degraded(properties.getDeepseekModel(), properties.getDeepseekMaxRetries());
+    }
+
+    private String buildUserPrompt(
+            String originalQuery,
+            List<ApiModels.QueryConstraint> constraints,
+            ApiModels.PaperItem paper
+    ) {
+        try {
+            List<Map<String, Object>> constraintPayload = constraints.stream().map(constraint -> {
+                Map<String, Object> value = new LinkedHashMap<>();
+                value.put("constraint_id", constraint.constraintId());
+                value.put("type", constraint.type());
+                value.put("description", constraint.description());
+                value.put("importance", constraint.importance());
+                value.put("original_text", constraint.originalText());
+                return value;
+            }).toList();
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("publication_year", paper.publicationYear());
+            metadata.put("publication_date", paper.publicationDate());
+            metadata.put("authors", safe(paper.authors()));
+            metadata.put("venue", paper.venue());
+            metadata.put("cited_by_count", paper.citedByCount());
+            metadata.put("doi", paper.doi());
+            Map<String, Object> selector = new LinkedHashMap<>();
+            selector.put("decision", paper.selected() ? "selected" : "dropped");
+            selector.put("score", paper.selectorScore() == null ? paper.score() : paper.selectorScore());
+            selector.put("reason", paper.selectorReason());
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("original_query", originalQuery);
+            payload.put("constraints", constraintPayload);
+            payload.put("paper_id", paper.paperId());
+            payload.put("title", text(paper.title()));
+            payload.put("abstract", text(paper.abstractText()));
+            payload.put("metadata", metadata);
+            payload.put("selector", selector);
+            // Phase 1/2 deliberately send no full text or citation graph.
+            payload.put("fulltext_excerpts", List.of());
+            payload.put("citations", List.of());
+            return "Audit the following input and return JSON matching the example schema:\n"
+                    + objectMapper.writeValueAsString(payload);
+        } catch (Exception exception) {
+            throw new IllegalStateException("Cannot serialize DeepSeek evidence prompt", exception);
+        }
+    }
+
+    ApiModels.DeepSeekTrace validate(
+            ApiModels.DeepSeekTrace raw,
+            List<ApiModels.QueryConstraint> constraints,
+            ApiModels.PaperItem paper
+    ) {
+        if (raw == null) {
+            throw new IllegalArgumentException("DeepSeek trace is null");
+        }
+        if (text(raw.recommendationReason()).isBlank()
+                || !RELEVANCE.contains(raw.relevanceLevel())
+                || raw.constraintResults() == null || raw.evidence() == null
+                || raw.satisfiedConstraints() == null || raw.partiallySatisfiedConstraints() == null
+                || raw.violatedConstraints() == null || raw.unknownConstraints() == null) {
+            throw new IllegalArgumentException("DeepSeek trace does not conform to evidence-v1 schema");
+        }
+        Set<String> allowedConstraints = constraints.stream()
+                .map(ApiModels.QueryConstraint::constraintId)
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+
+        List<ApiModels.DeepSeekEvidence> evidence = new ArrayList<>();
+        Set<String> seenEvidence = new HashSet<>();
+        for (ApiModels.DeepSeekEvidence item : safe(raw.evidence())) {
+            if (validEvidence(item, paper, allowedConstraints) && seenEvidence.add(item.evidenceId())) {
+                List<String> supports = safe(item.supportsConstraints()).stream()
+                        .filter(allowedConstraints::contains).distinct().toList();
+                evidence.add(new ApiModels.DeepSeekEvidence(item.evidenceId(), item.sourceType(),
+                        item.exactText(), normalizedLocation(item), supports, clamp(item.confidence())));
+            }
+        }
+        Set<String> validEvidenceIds = evidence.stream().map(ApiModels.DeepSeekEvidence::evidenceId)
+                .collect(java.util.stream.Collectors.toSet());
+
+        Map<String, ApiModels.DeepSeekConstraintResult> byConstraint = new LinkedHashMap<>();
+        for (ApiModels.DeepSeekConstraintResult result : safe(raw.constraintResults())) {
+            if (result == null || text(result.constraintId()).isBlank() || !STATUSES.contains(result.status())
+                    || result.explanation() == null || result.evidenceIds() == null) {
+                throw new IllegalArgumentException("constraint_results violates evidence-v1 schema");
+            }
+            if (!allowedConstraints.contains(result.constraintId())
+                    || byConstraint.containsKey(result.constraintId())) {
+                continue;
+            }
+            String status = result.status();
+            String explanation = text(result.explanation());
+            List<String> ids = safe(result.evidenceIds()).stream()
+                    .filter(validEvidenceIds::contains).distinct().toList();
+            if (!"unknown".equals(status) && ids.isEmpty()) {
+                status = "unknown";
+                explanation = "未找到可验证的原文证据，无法确认该条件。";
+            }
+            if ("unknown".equals(status)) {
+                ids = List.of();
+            }
+            byConstraint.put(result.constraintId(), new ApiModels.DeepSeekConstraintResult(
+                    result.constraintId(), status, explanation, ids, clamp(result.confidence())));
+        }
+        for (String constraintId : allowedConstraints) {
+            byConstraint.putIfAbsent(constraintId, new ApiModels.DeepSeekConstraintResult(
+                    constraintId, "unknown", "模型未返回可验证判断。", List.of(), 0));
+        }
+        List<ApiModels.DeepSeekConstraintResult> results = List.copyOf(byConstraint.values());
+        String relevance = raw.relevanceLevel();
+        // Keep the model's natural synthesis. Constraint/evidence structures are validated separately.
+        String reason = raw.recommendationReason().strip();
+        return new ApiModels.DeepSeekTrace(
+                reason,
+                relevance,
+                results,
+                List.copyOf(evidence),
+                idsByStatus(results, "satisfied"),
+                idsByStatus(results, "partially_satisfied"),
+                idsByStatus(results, "violated"),
+                idsByStatus(results, "unknown")
+        );
+    }
+
+    private boolean validEvidence(
+            ApiModels.DeepSeekEvidence evidence,
+            ApiModels.PaperItem paper,
+            Set<String> allowedConstraints
+    ) {
+        if (evidence == null || text(evidence.evidenceId()).isBlank()
+                || !SOURCE_TYPES.contains(evidence.sourceType()) || text(evidence.exactText()).isBlank()) {
+            return false;
+        }
+        if (safe(evidence.supportsConstraints()).stream().noneMatch(allowedConstraints::contains)) {
+            return false;
+        }
+        String quote = evidence.exactText().strip();
+        return switch (evidence.sourceType()) {
+            case "title" -> text(paper.title()).contains(quote);
+            case "abstract" -> text(paper.abstractText()).contains(quote);
+            case "metadata" -> metadataValues(paper).stream()
+                    .anyMatch(value -> value.equals(quote) || value.contains(quote));
+            // Phase 1/2 never supplies full-text excerpts, so full-text evidence cannot validate.
+            case "fulltext" -> false;
+            default -> false;
+        };
+    }
+
+    private static ApiModels.DeepSeekEvidenceLocation normalizedLocation(ApiModels.DeepSeekEvidence evidence) {
+        ApiModels.DeepSeekEvidenceLocation location = evidence.location();
+        if (location == null) {
+            return new ApiModels.DeepSeekEvidenceLocation(evidence.sourceType(), null, null, null);
+        }
+        return new ApiModels.DeepSeekEvidenceLocation(
+                text(location.field()).isBlank() ? evidence.sourceType() : location.field(),
+                location.sentenceIndex(), location.section(), location.page());
+    }
+
+    private static List<String> idsByStatus(
+            List<ApiModels.DeepSeekConstraintResult> results,
+            String status
+    ) {
+        return results.stream().filter(result -> status.equals(result.status()))
+                .map(ApiModels.DeepSeekConstraintResult::constraintId).toList();
+    }
+
+    private static List<String> metadataValues(ApiModels.PaperItem paper) {
+        List<String> values = new ArrayList<>();
+        if (paper.publicationYear() != null) values.add(Integer.toString(paper.publicationYear()));
+        if (paper.publicationDate() != null) values.add(paper.publicationDate());
+        if (paper.venue() != null) values.add(paper.venue());
+        if (paper.doi() != null) values.add(paper.doi());
+        values.addAll(safe(paper.authors()));
+        return values;
+    }
+
+    private void putCache(String key, ApiModels.DeepSeekTrace value) {
+        if (cache.size() >= properties.getDeepseekCacheMaxEntries()) {
+            cache.keySet().stream().findFirst().ifPresent(cache::remove);
+        }
+        cache.put(key, value);
+    }
+
+    private static ApiModels.PaperItem withTrace(
+            ApiModels.PaperItem paper,
+            String status,
+            ApiModels.DeepSeekTrace trace
+    ) {
+        return new ApiModels.PaperItem(
+                paper.paperId(), paper.arxivId(), paper.openalexId(), paper.doi(), paper.title(),
+                paper.abstractText(), paper.score(), paper.selected(), paper.depth(), paper.source(),
+                paper.arxivUrl(), paper.url(), paper.publicationYear(), paper.publicationDate(),
+                paper.venue(), paper.citedByCount(), safe(paper.authors()), safe(paper.retrievalProviders()),
+                paper.abstractStatus(), paper.abstractSource(), paper.abstractSourceUrl(), paper.recommendationTrace(),
+                paper.selectorScore() == null ? paper.score() : paper.selectorScore(), paper.selectorReason(),
+                status, trace);
+    }
+
+    private static String cacheKey(String query, String paperId, String promptVersion) {
+        try {
+            String value = text(query) + "\n" + text(paperId) + "\n" + text(promptVersion);
+            return java.util.HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception exception) {
+            throw new IllegalStateException(exception);
+        }
+    }
+
+    private static String loadPrompt(String promptVersion) {
+        try {
+            String version = text(promptVersion).matches("[A-Za-z0-9._-]+")
+                    ? promptVersion : "evidence-v2";
+            return new ClassPathResource("prompts/deepseek-" + version + ".txt")
+                    .getContentAsString(StandardCharsets.UTF_8);
+        } catch (IOException exception) {
+            throw new IllegalStateException("Cannot load DeepSeek evidence prompt", exception);
+        }
+    }
+
+    private static double clamp(double value) {
+        if (!Double.isFinite(value)) return 0;
+        return Math.max(0, Math.min(1, value));
+    }
+
+    private static String text(String value) {
+        return value == null ? "" : value;
+    }
+
+    private static <T> List<T> safe(List<T> value) {
+        return value == null ? List.of() : value;
+    }
+
+    public record BatchResult(List<ApiModels.PaperItem> papers, ApiModels.DeepSeekUsageStats usage) {}
+
+    private record Outcome(
+            String status,
+            ApiModels.DeepSeekTrace trace,
+            long calls,
+            long inputTokens,
+            long outputTokens,
+            int retries,
+            boolean cacheHit,
+            String modelName
+    ) {
+        private static Outcome degraded(String model, int retries) {
+            return new Outcome("degraded", null, retries + 1L, 0, 0, retries, false, model);
+        }
+    }
+}

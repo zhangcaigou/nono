@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from backend.config import Settings
-from backend.schemas import ModelSearchRequest, TaskProgress, TaskStage
+from backend.schemas import ModelSearchRequest, ModelSearchResponse, SearchAnalysis, TaskProgress, TaskStage
 
 
 ProgressCallback = Callable[[TaskStage, TaskProgress], None]
@@ -26,6 +26,7 @@ class TaskCancelledError(EngineError):
 
 class SearchEngine(Protocol):
     def run(self, request: ModelSearchRequest, progress: ProgressCallback) -> dict[str, Any]: ...
+    def analyze(self, request: ModelSearchRequest, result: ModelSearchResponse) -> SearchAnalysis | None: ...
 
 
 def _tree_counts(tree: dict[str, Any]) -> tuple[int, int]:
@@ -114,6 +115,11 @@ class MockSearchEngine:
             "extra": {},
         }
 
+    def analyze(self, request: ModelSearchRequest, result: ModelSearchResponse) -> SearchAnalysis:
+        from backend.analyzer import mock_analysis
+
+        return mock_analysis(result)
+
 
 class PasaSearchEngine:
     """Lazy adapter around the original synchronous PaSa implementation."""
@@ -123,6 +129,7 @@ class PasaSearchEngine:
         self._load_lock = threading.Lock()
         self._crawler: Any | None = None
         self._selector: Any | None = None
+        self._analyzer: Any | None = None
 
     def _load_models(self) -> tuple[Any, Any]:
         with self._load_lock:
@@ -170,6 +177,18 @@ class PasaSearchEngine:
             }
             if end_date is not None:
                 kwargs["end_date"] = end_date
+
+            def publish_search_progress(found: int, selected: int) -> None:
+                progress(
+                    TaskStage.SEARCHING,
+                    TaskProgress(
+                        total_layers=total,
+                        papers_found=found,
+                        papers_selected=selected,
+                    ),
+                )
+
+            kwargs["progress_callback"] = publish_search_progress
             agent = PaperAgent(**kwargs)
 
             progress(TaskStage.GENERATING_QUERIES, TaskProgress(total_layers=total))
@@ -201,6 +220,14 @@ class PasaSearchEngine:
             raise
         except Exception as exc:
             raise EngineError(str(exc)) from exc
+
+    def analyze(self, request: ModelSearchRequest, result: ModelSearchResponse) -> SearchAnalysis | None:
+        from backend.analyzer import SearchResultAnalyzer
+
+        crawler, _ = self._load_models()
+        if self._analyzer is None:
+            self._analyzer = SearchResultAnalyzer(crawler, self.settings)
+        return self._analyzer.analyze(request.query, result)
 
 
 def create_engine(settings: Settings) -> SearchEngine:

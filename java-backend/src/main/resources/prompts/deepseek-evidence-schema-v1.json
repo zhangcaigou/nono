@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pasa://deepseek/evidence-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "recommendation_reason", "relevance_level", "constraint_results", "evidence",
+    "satisfied_constraints", "partially_satisfied_constraints", "violated_constraints", "unknown_constraints"
+  ],
+  "properties": {
+    "recommendation_reason": {"type": "string", "minLength": 1},
+    "relevance_level": {"enum": ["high", "partial", "low"]},
+    "constraint_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["constraint_id", "status", "explanation", "evidence_ids", "confidence"],
+        "properties": {
+          "constraint_id": {"type": "string", "minLength": 1},
+          "status": {"enum": ["satisfied", "partially_satisfied", "violated", "unknown"]},
+          "explanation": {"type": "string"},
+          "evidence_ids": {"type": "array", "items": {"type": "string"}},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidence_id", "source_type", "exact_text", "location", "supports_constraints", "confidence"],
+        "properties": {
+          "evidence_id": {"type": "string", "minLength": 1},
+          "source_type": {"enum": ["title", "abstract", "fulltext", "metadata"]},
+          "exact_text": {"type": "string", "minLength": 1},
+          "location": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["field", "sentence_index", "section", "page"],
+            "properties": {
+              "field": {"type": "string"},
+              "sentence_index": {"type": ["integer", "null"]},
+              "section": {"type": ["string", "null"]},
+              "page": {"type": ["integer", "null"]}
+            }
+          },
+          "supports_constraints": {"type": "array", "items": {"type": "string"}},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    },
+    "satisfied_constraints": {"type": "array", "items": {"type": "string"}},
+    "partially_satisfied_constraints": {"type": "array", "items": {"type": "string"}},
+    "violated_constraints": {"type": "array", "items": {"type": "string"}},
+    "unknown_constraints": {"type": "array", "items": {"type": "string"}}
+  }
+}

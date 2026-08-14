@@ -27,12 +27,20 @@ export const formatTime = (iso: string | null): string => {
   }
 }
 
-// 计算耗时（秒）
+// 格式化非负耗时。运行中任务使用浏览器本地累加值，避免服务器与浏览器时钟偏差产生负数。
+export const formatElapsedDuration = (milliseconds: number): string => {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000))
+  if (totalSeconds < 60) return `${totalSeconds} 秒`
+  const mins = Math.floor(totalSeconds / 60)
+  const secs = totalSeconds % 60
+  return `${mins} 分 ${secs} 秒`
+}
+
+// 使用同一时钟来源的两个时间戳计算最终耗时
 export const calcDuration = (start: string | null, end: string | null): string => {
   if (!start || !end) return '--'
-  const diff = (new Date(end).getTime() - new Date(start).getTime()) / 1000
-  if (diff < 60) return `${Math.round(diff)} 秒`
-  const mins = Math.floor(diff / 60)
-  const secs = Math.round(diff % 60)
-  return `${mins} 分 ${secs} 秒`
+  const startTime = new Date(start).getTime()
+  const endTime = new Date(end).getTime()
+  if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) return '--'
+  return formatElapsedDuration(endTime - startTime)
 }

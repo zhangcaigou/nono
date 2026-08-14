@@ -22,6 +22,17 @@ public class PasaProperties {
     private int traceCacheMaxEntries = 200;
     private boolean traceFulltextEnabled = true;
     private int traceFulltextMaxPassages = 120;
+    private String deepseekApiKey = "";
+    private String deepseekBaseUrl = "https://api.deepseek.com";
+    private String deepseekModel = "deepseek-v4-flash";
+    private boolean deepseekEvidenceEnabled = true;
+    private int deepseekTimeout = 60;
+    private int deepseekMaxRetries = 2;
+    private int deepseekMaxPapers = 20;
+    private boolean deepseekFulltextEnabled = false;
+    private int deepseekConcurrency = 4;
+    private int deepseekCacheMaxEntries = 1000;
+    private String deepseekPromptVersion = "evidence-v2";
     private String semanticScholarApiKey = "";
     private String openAlexApiKey = "";
     private String openAlexEmail = "";
@@ -55,6 +66,28 @@ public class PasaProperties {
     public void setTraceFulltextEnabled(boolean value) { this.traceFulltextEnabled = value; }
     public int getTraceFulltextMaxPassages() { return traceFulltextMaxPassages; }
     public void setTraceFulltextMaxPassages(int value) { this.traceFulltextMaxPassages = Math.max(1, value); }
+    public String getDeepseekApiKey() { return deepseekApiKey; }
+    public void setDeepseekApiKey(String value) { this.deepseekApiKey = value == null ? "" : value; }
+    public String getDeepseekBaseUrl() { return deepseekBaseUrl; }
+    public void setDeepseekBaseUrl(String value) { this.deepseekBaseUrl = value == null ? "https://api.deepseek.com" : value; }
+    public String getDeepseekModel() { return deepseekModel; }
+    public void setDeepseekModel(String value) { this.deepseekModel = value == null ? "deepseek-v4-flash" : value; }
+    public boolean isDeepseekEvidenceEnabled() { return deepseekEvidenceEnabled; }
+    public void setDeepseekEvidenceEnabled(boolean value) { this.deepseekEvidenceEnabled = value; }
+    public int getDeepseekTimeout() { return deepseekTimeout; }
+    public void setDeepseekTimeout(int value) { this.deepseekTimeout = Math.max(1, value); }
+    public int getDeepseekMaxRetries() { return deepseekMaxRetries; }
+    public void setDeepseekMaxRetries(int value) { this.deepseekMaxRetries = Math.max(0, value); }
+    public int getDeepseekMaxPapers() { return deepseekMaxPapers; }
+    public void setDeepseekMaxPapers(int value) { this.deepseekMaxPapers = Math.max(0, value); }
+    public boolean isDeepseekFulltextEnabled() { return deepseekFulltextEnabled; }
+    public void setDeepseekFulltextEnabled(boolean value) { this.deepseekFulltextEnabled = value; }
+    public int getDeepseekConcurrency() { return deepseekConcurrency; }
+    public void setDeepseekConcurrency(int value) { this.deepseekConcurrency = Math.max(1, value); }
+    public int getDeepseekCacheMaxEntries() { return deepseekCacheMaxEntries; }
+    public void setDeepseekCacheMaxEntries(int value) { this.deepseekCacheMaxEntries = Math.max(1, value); }
+    public String getDeepseekPromptVersion() { return deepseekPromptVersion; }
+    public void setDeepseekPromptVersion(String value) { this.deepseekPromptVersion = value == null ? "evidence-v2" : value; }
     public String getSemanticScholarApiKey() { return semanticScholarApiKey; }
     public void setSemanticScholarApiKey(String value) { this.semanticScholarApiKey = value == null ? "" : value; }
     public String getOpenAlexApiKey() { return openAlexApiKey; }

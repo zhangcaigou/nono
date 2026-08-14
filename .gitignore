@@ -44,8 +44,7 @@ env/
 build/
 
 # Java / Maven build output
-/java-backend/target/
-/java-backend/target.*/
+/java-backend/target*/
 **/.mvn/timing.properties
 *.class
 

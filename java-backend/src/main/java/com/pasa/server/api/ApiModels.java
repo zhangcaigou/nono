@@ -97,7 +97,16 @@ public final class ApiModels {
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"string", "null"}) String abstractSourceUrl,
             @JsonProperty("recommendation_trace")
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"object", "null"})
-            RecommendationTrace recommendationTrace
+            RecommendationTrace recommendationTrace,
+            @JsonProperty("selector_score")
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"number", "null"}) Double selectorScore,
+            @JsonProperty("selector_reason")
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"string", "null"}) String selectorReason,
+            @JsonProperty("trace_status")
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
+                    allowableValues = {"success", "degraded", "disabled"}) String traceStatus,
+            @JsonProperty("deepseek_trace")
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"object", "null"}) DeepSeekTrace deepseekTrace
     ) {
         public PaperItem(
                 String paperId, String arxivId, String openalexId, String doi, String title,
@@ -109,7 +118,65 @@ public final class ApiModels {
                     source, arxivUrl, url, publicationYear, publicationDate, venue, citedByCount,
                     authors, retrievalProviders, null, null, null, null);
         }
+
+        public PaperItem(
+                String paperId, String arxivId, String openalexId, String doi, String title,
+                String abstractText, double score, boolean selected, int depth, String source,
+                String arxivUrl, String url, Integer publicationYear, String publicationDate,
+                String venue, int citedByCount, List<String> authors, List<String> retrievalProviders,
+                String abstractStatus, String abstractSource, String abstractSourceUrl,
+                RecommendationTrace recommendationTrace
+        ) {
+            this(paperId, arxivId, openalexId, doi, title, abstractText, score, selected, depth,
+                    source, arxivUrl, url, publicationYear, publicationDate, venue, citedByCount,
+                    authors, retrievalProviders, abstractStatus, abstractSource, abstractSourceUrl,
+                    recommendationTrace, score, null, "disabled", null);
+        }
     }
+
+    public record DeepSeekEvidenceLocation(
+            String field,
+            @JsonProperty("sentence_index") Integer sentenceIndex,
+            String section,
+            Integer page
+    ) {}
+
+    public record DeepSeekEvidence(
+            @JsonProperty("evidence_id") String evidenceId,
+            @JsonProperty("source_type") String sourceType,
+            @JsonProperty("exact_text") String exactText,
+            DeepSeekEvidenceLocation location,
+            @JsonProperty("supports_constraints") List<String> supportsConstraints,
+            double confidence
+    ) {}
+
+    public record DeepSeekConstraintResult(
+            @JsonProperty("constraint_id") String constraintId,
+            String status,
+            String explanation,
+            @JsonProperty("evidence_ids") List<String> evidenceIds,
+            double confidence
+    ) {}
+
+    public record DeepSeekTrace(
+            @JsonProperty("recommendation_reason") String recommendationReason,
+            @JsonProperty("relevance_level") String relevanceLevel,
+            @JsonProperty("constraint_results") List<DeepSeekConstraintResult> constraintResults,
+            List<DeepSeekEvidence> evidence,
+            @JsonProperty("satisfied_constraints") List<String> satisfiedConstraints,
+            @JsonProperty("partially_satisfied_constraints") List<String> partiallySatisfiedConstraints,
+            @JsonProperty("violated_constraints") List<String> violatedConstraints,
+            @JsonProperty("unknown_constraints") List<String> unknownConstraints
+    ) {}
+
+    public record DeepSeekUsageStats(
+            @JsonProperty("total_calls") long totalCalls,
+            @JsonProperty("input_tokens") long inputTokens,
+            @JsonProperty("output_tokens") long outputTokens,
+            @JsonProperty("cache_hits") long cacheHits,
+            @JsonProperty("degraded_papers") long degradedPapers,
+            @JsonProperty("model_name") String modelName
+    ) {}
 
     public record Evidence(
             @JsonProperty("evidence_id") @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String evidenceId,
@@ -129,8 +196,15 @@ public final class ApiModels {
             @JsonProperty("constraint_id") @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String constraintId,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     allowableValues = {"hard", "soft", "exclusion", "output"}) String type,
-            @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String text
-    ) {}
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String text,
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String importance,
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String description,
+            @JsonProperty("original_text") @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String originalText
+    ) {
+        public QueryConstraint(String constraintId, String type, String text) {
+            this(constraintId, type, text, type, text, text);
+        }
+    }
 
     public record ConstraintAssessment(
             @JsonProperty("constraint_id") @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String constraintId,
@@ -197,11 +271,15 @@ public final class ApiModels {
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED) List<PaperItem> papers,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED) List<PaperRelation> relations,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED) JsonNode tree,
-            @Schema(requiredMode = Schema.RequiredMode.REQUIRED) ResultSummary summary
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED) ResultSummary summary,
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"object", "null"}) JsonNode analysis,
+            @JsonProperty("deepseek_usage")
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"object", "null"})
+            DeepSeekUsageStats deepseekUsage
     ) {
         public TaskResult(String taskId, String query, List<PaperItem> papers, JsonNode tree,
                           ResultSummary summary) {
-            this(taskId, query, List.of(), false, papers, List.of(), tree, summary);
+            this(taskId, query, List.of(), false, papers, List.of(), tree, summary, null, null);
         }
     }
 

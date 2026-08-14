@@ -40,6 +40,12 @@ class Settings:
     mock_step_delay: float
     debug: bool
     internal_token: str
+    analysis_enabled: bool
+    analysis_top_n: int
+    analysis_pair_limit: int
+    analysis_batch_size: int
+    analysis_abstract_chars: int
+    analysis_cache_max_entries: int
 
     @property
     def is_mock(self) -> bool:
@@ -125,4 +131,10 @@ def get_settings() -> Settings:
         mock_step_delay=mock_step_delay,
         debug=_as_bool(os.getenv("PASA_DEBUG")),
         internal_token=os.getenv("PASA_INTERNAL_TOKEN", ""),
+        analysis_enabled=_as_bool(os.getenv("PASA_ANALYSIS_ENABLED"), True),
+        analysis_top_n=max(1, _as_int("PASA_ANALYSIS_TOP_N", 10)),
+        analysis_pair_limit=max(1, _as_int("PASA_ANALYSIS_PAIR_LIMIT", 15)),
+        analysis_batch_size=max(1, _as_int("PASA_ANALYSIS_BATCH_SIZE", 5)),
+        analysis_abstract_chars=max(300, _as_int("PASA_ANALYSIS_ABSTRACT_CHARS", 1600)),
+        analysis_cache_max_entries=max(1, _as_int("PASA_ANALYSIS_CACHE_MAX_ENTRIES", 100)),
     )

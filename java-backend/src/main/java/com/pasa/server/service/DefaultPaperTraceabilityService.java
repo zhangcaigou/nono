@@ -196,7 +196,7 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
         List<ApiModels.RecommendationReason> reasons = assessments.stream()
                 .filter(item -> !item.evidenceIds().isEmpty())
                 .map(item -> new ApiModels.RecommendationReason(
-                        recommendationReason(item, collectedEvidence),
+                        recommendationReason(paper, item, collectedEvidence),
                         List.of(item.constraintId()), item.evidenceIds()))
                 .toList();
         return new ApiModels.RecommendationTrace(
@@ -495,7 +495,9 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
                 textOr(abstractText, ""), paper.score(), paper.selected(), paper.depth(), textOr(paper.source(), ""),
                 paper.arxivUrl(), paper.url(), paper.publicationYear(), paper.publicationDate(), paper.venue(),
                 paper.citedByCount(), safeList(paper.authors()), safeList(paper.retrievalProviders()),
-                abstractStatus, abstractSource, abstractSourceUrl, trace);
+                abstractStatus, abstractSource, abstractSourceUrl, trace,
+                paper.selectorScore() == null ? paper.score() : paper.selectorScore(), paper.selectorReason(),
+                paper.traceStatus() == null ? "disabled" : paper.traceStatus(), paper.deepseekTrace());
     }
 
     private static Set<String> tokens(String value) {
@@ -593,9 +595,13 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
     }
 
     private static String recommendationReason(
+            ApiModels.PaperItem paper,
             ApiModels.ConstraintAssessment assessment,
             List<ApiModels.Evidence> evidence
     ) {
+        ApiModels.Evidence supportingEvidence = evidence.stream()
+                .filter(item -> assessment.evidenceIds().contains(item.evidenceId()))
+                .findFirst().orElse(null);
         Set<String> sourceTypes = evidence.stream()
                 .filter(item -> assessment.evidenceIds().contains(item.evidenceId()))
                 .map(ApiModels.Evidence::sourceType)
@@ -610,8 +616,14 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
         String sourceDescription = sourceLabels.isEmpty()
                 ? "当前可用"
                 : String.join("与", sourceLabels);
-        return "基于" + sourceDescription + "证据，" + assessment.constraintId() + "："
-                + assessment.explanation();
+        String quote = supportingEvidence == null ? ""
+                : clean(supportingEvidence.exactText());
+        if (quote.length() > 100) {
+            quote = quote.substring(0, 100) + "…";
+        }
+        return "《" + paper.title() + "》的" + sourceDescription + "证据"
+                + (quote.isBlank() ? "" : "“" + quote + "”")
+                + "支持以下判断，" + assessment.constraintId() + "：" + assessment.explanation();
     }
 
     private static FullTextMatch fullTextMatch(List<FullTextClient.FullTextPassage> passages, String term) {

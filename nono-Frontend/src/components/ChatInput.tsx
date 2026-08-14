@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, KeyboardEvent } from 'react'
 import { validateQuery } from '@/utils/validation'
+import { SearchFormOptions } from '@/types'
 
 interface ChatInputProps {
-  onSubmit: (query: string, options?: any) => void
+  onSubmit: (query: string, options?: SearchFormOptions) => void
   isSubmitting: boolean
   disabled?: boolean
   placeholder?: string
