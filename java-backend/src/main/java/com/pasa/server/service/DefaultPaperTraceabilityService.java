@@ -354,11 +354,11 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
             }
         }
         relationIndex = addInferredRelations(relations, relationIndex, papers, outputConstraintIds,
-                "same_dataset", DATASET_TERMS, 0.9);
+                "same_dataset", DATASET_TERMS, 0.63);
         relationIndex = addInferredRelations(relations, relationIndex, papers, outputConstraintIds,
-                "same_task", TASK_TERMS, 0.82);
+                "same_task", TASK_TERMS, 0.55);
         addInferredRelations(relations, relationIndex, papers, outputConstraintIds,
-                "same_method", METHOD_TERMS, 0.82);
+                "same_method", METHOD_TERMS, 0.55);
         return List.copyOf(relations.values());
     }
 
@@ -369,7 +369,7 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
             List<String> constraintIds,
             String type,
             Set<String> vocabulary,
-            double confidence
+            double relationPrior
     ) {
         int index = startIndex;
         for (int left = 0; left < papers.size(); left++) {
@@ -379,8 +379,10 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
                 if (hasRelationBetween(relations, first.paperId(), second.paperId())) {
                     continue;
                 }
-                Set<String> shared = signals(first, vocabulary);
-                shared.retainAll(signals(second, vocabulary));
+                Set<String> firstSignals = signals(first, vocabulary);
+                Set<String> secondSignals = signals(second, vocabulary);
+                Set<String> shared = new LinkedHashSet<>(firstSignals);
+                shared.retainAll(secondSignals);
                 if (shared.isEmpty()) {
                     continue;
                 }
@@ -388,6 +390,9 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
                 String relationId = "R" + index++;
                 Sentence firstSentence = bestSentence(first, signal);
                 Sentence secondSentence = bestSentence(second, signal);
+                double confidence = inferredRelationConfidence(
+                        first, second, firstSignals, secondSignals, shared,
+                        firstSentence != null, secondSentence != null, relationPrior);
                 ApiModels.Evidence firstEvidence = relationEvidence(relationId + "-E1", first,
                         firstSentence, signal, constraintIds, confidence);
                 ApiModels.Evidence secondEvidence = relationEvidence(relationId + "-E2", second,
@@ -401,6 +406,60 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
             }
         }
         return index;
+    }
+
+    /**
+     * Scores each inferred relation from its own support instead of assigning one constant value.
+     * Exact dataset matches start with a stronger prior; shared-signal coverage, evidence in both
+     * abstracts, and the two selector scores then contribute bounded, independently varying support.
+     */
+    private static double inferredRelationConfidence(
+            ApiModels.PaperItem first,
+            ApiModels.PaperItem second,
+            Set<String> firstSignals,
+            Set<String> secondSignals,
+            Set<String> shared,
+            boolean firstHasAbstractEvidence,
+            boolean secondHasAbstractEvidence,
+            double relationPrior
+    ) {
+        double coverage = (double) shared.size() / Math.max(firstSignals.size(), secondSignals.size());
+        double breadth = Math.min(1.0, shared.size() / 3.0);
+        double evidenceSupport = (double) ((firstHasAbstractEvidence ? 1 : 0)
+                + (secondHasAbstractEvidence ? 1 : 0)) / 2.0;
+        double firstScore = normalizedPaperScore(first);
+        double secondScore = normalizedPaperScore(second);
+        double pairRelevance = (firstScore + secondScore) / 2.0;
+        double scoreAgreement = 1.0 - Math.abs(firstScore - secondScore);
+        double textSimilarity = jaccardSimilarity(contentTokens(first), contentTokens(second));
+        double titleSimilarity = jaccardSimilarity(tokens(first.title()), tokens(second.title()));
+        double confidence = relationPrior
+                + 0.10 * coverage
+                + 0.05 * breadth
+                + 0.03 * evidenceSupport
+                + 0.08 * pairRelevance
+                + 0.02 * scoreAgreement
+                + 0.12 * textSimilarity
+                + 0.05 * titleSimilarity;
+        return Math.max(0.0, Math.min(0.99, confidence));
+    }
+
+    private static double normalizedPaperScore(ApiModels.PaperItem paper) {
+        double score = paper.selectorScore() == null ? paper.score() : paper.selectorScore();
+        return Math.max(0.0, Math.min(1.0, score));
+    }
+
+    private static Set<String> contentTokens(ApiModels.PaperItem paper) {
+        return tokens(textOr(paper.title(), "") + " " + textOr(paper.abstractText(), ""));
+    }
+
+    private static double jaccardSimilarity(Set<String> first, Set<String> second) {
+        if (first.isEmpty() || second.isEmpty()) return 0.0;
+        Set<String> intersection = new LinkedHashSet<>(first);
+        intersection.retainAll(second);
+        Set<String> union = new LinkedHashSet<>(first);
+        union.addAll(second);
+        return (double) intersection.size() / union.size();
     }
 
     private static ApiModels.Evidence relationEvidence(

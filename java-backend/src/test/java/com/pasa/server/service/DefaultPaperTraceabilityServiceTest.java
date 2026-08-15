@@ -105,6 +105,29 @@ class DefaultPaperTraceabilityServiceTest {
     }
 
     @Test
+    void computesRelationSpecificConfidenceInsteadOfUsingOneFixedPercentage() {
+        PasaProperties properties = new PasaProperties();
+        properties.setEnrichmentEnabled(false);
+        DefaultPaperTraceabilityService service = service(
+                paper -> ScholarlyMetadataClient.PaperMetadata.empty(), properties);
+        List<ApiModels.PaperItem> papers = List.of(
+                paperWithScore("local:1", "Transformer and attention for classification.",
+                        "First", 0.95),
+                paperWithScore("local:2", "Transformer classification.",
+                        "Second", 0.82),
+                paperWithScore("local:3", "Transformer generation.",
+                        "Third", 0.61));
+
+        List<Double> confidences = service.enrich("transformer research", null, papers).relations().stream()
+                .filter(relation -> relation.type().equals("same_method"))
+                .map(ApiModels.PaperRelation::confidence)
+                .distinct()
+                .toList();
+
+        assertThat(confidences).hasSizeGreaterThan(1).allMatch(value -> value > 0.0 && value < 1.0);
+    }
+
+    @Test
     void cachesTraceResults() {
         PasaProperties properties = new PasaProperties();
         AtomicInteger calls = new AtomicInteger();
@@ -271,5 +294,16 @@ class DefaultPaperTraceabilityServiceTest {
         return new ApiModels.PaperItem(id, "", openAlexId, null, title, abstractText, 0.9,
                 selected, 0, "SearchFrom:openalex", null, "https://openalex.org/" + openAlexId,
                 year, null, "Test Venue", 0, List.of("Author"), List.of("openalex"));
+    }
+
+    private static ApiModels.PaperItem paperWithScore(
+            String id,
+            String abstractText,
+            String title,
+            double score
+    ) {
+        return new ApiModels.PaperItem(id, "", null, null, title, abstractText, score,
+                true, 0, "SearchFrom:test", null, null, 2025, null,
+                "Test Venue", 0, List.of("Author"), List.of("test"));
     }
 }

@@ -95,6 +95,27 @@ class DeepSeekEvidenceGeneratorTest {
     }
 
     @Test
+    void removesUnhelpfulMissingInformationCaveatsFromRecommendationParagraph() {
+        String reason = "该论文提出面向无人机定位的知识蒸馏方法，与检索主题直接相关。"
+                + "实验使用真实飞行数据；然而，摘要未提供代码或数据集可用性信息，因此无法确认。";
+        DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(traceJson(
+                "high", reason, result("C1", "satisfied", "E1") + ","
+                        + result("C2", "unknown", null),
+                evidence("E1", "title", "UAV Localization", "C1"))));
+
+        ApiModels.DeepSeekTrace trace = generator.enrich(
+                "UAV localization with open code",
+                List.of(constraint("C1", "hard"), constraint("C2", "soft")),
+                List.of(paper("useful-reason", "UAV Localization", "A localization method.")))
+                .papers().getFirst().deepseekTrace();
+
+        assertThat(trace.recommendationReason())
+                .contains("知识蒸馏方法", "实验使用真实飞行数据")
+                .doesNotContain("未提供", "无法确认");
+        assertThat(trace.unknownConstraints()).containsExactly("C2");
+    }
+
+    @Test
     void removesHallucinatedExactTextAndChangesJudgmentToUnknown() {
         DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(traceJson(
                 "high", "Claims open source code.", result("C1", "satisfied", "E1"),

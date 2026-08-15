@@ -15,6 +15,7 @@ import {
   SearchAnalysis,
   SearchFormOptions,
   DeepSeekTrace,
+  QueryConstraint,
 } from '@/types'
 import {
   getTask,
@@ -74,8 +75,7 @@ export default function TaskPage() {
   const timersRef = useRef<Map<string, number>>(new Map())
   const activePollsRef = useRef<Set<string>>(new Set())
   const isMountedRef = useRef(true)
-  const isNearBottomRef = useRef(true)
-  const prevConvLengthRef = useRef(0)
+  const shouldScrollToFollowUpRef = useRef(false)
 
   // ===== 获取任务数据并按需轮询 =====
   const fetchAndPoll = useCallback(async (taskId: string, index: number) => {
@@ -219,21 +219,6 @@ export default function TaskPage() {
     }
   }, [urlTaskId, fetchAndPoll])
 
-  // ===== 监听用户滚动位置，判断是否靠近底部 =====
-  useEffect(() => {
-    const container = scrollContainerRef.current
-    if (!container) return
-
-    const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = container
-      // 距离底部 100px 以内视为"靠近底部"
-      isNearBottomRef.current = scrollHeight - scrollTop - clientHeight < 100
-    }
-
-    container.addEventListener('scroll', handleScroll, { passive: true })
-    return () => container.removeEventListener('scroll', handleScroll)
-  }, [isPageLoading])
-
   // ===== 测量聊天容器实际宽度（不含滚动条），供结果面板精确占满全宽，避免水平滚动条 =====
   const [chatWidth, setChatWidth] = useState<number | null>(null)
 
@@ -247,15 +232,14 @@ export default function TaskPage() {
     return () => ro.disconnect()
   }, [isPageLoading])
 
-  // ===== 智能自动滚动：仅在用户靠近底部或有新消息时滚动 =====
+  // ===== 仅在用户主动追加追问时定位到新消息 =====
+  // 轮询进度和搜索结果会频繁更新 conversation；这些更新不能改变用户当前阅读位置。
   useEffect(() => {
-    const isNewMessage = conversation.length > prevConvLengthRef.current
-    prevConvLengthRef.current = conversation.length
-
-    if (isNewMessage || isNearBottomRef.current) {
+    if (shouldScrollToFollowUpRef.current) {
+      shouldScrollToFollowUpRef.current = false
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
-  }, [conversation])
+  }, [conversation.length])
 
   // ===== 追问：在当前对话中追加 =====
   const handleFollowUp = async (query: string, opts?: SearchFormOptions) => {
@@ -278,6 +262,7 @@ export default function TaskPage() {
         error: null,
       }
 
+      shouldScrollToFollowUpRef.current = true
       setConversation((prev) => {
         const updated = [...prev, newEntry]
         saveConversation(urlTaskId, updated.map((e) => ({ taskId: e.taskId, query: e.query })))
@@ -809,6 +794,7 @@ function ConversationMessage({
                     papers={sortedPapers}
                     relations={allRelations}
                     allPapers={result.papers}
+                    constraints={result.constraints || []}
                     traceabilityEnabled={result.traceability_enabled ?? false}
                     paperAnalyses={result.analysis?.paper_analyses || []}
                   />
@@ -1085,12 +1071,14 @@ function PaperResultsPanel({
   papers,
   relations,
   allPapers,
+  constraints,
   traceabilityEnabled,
   paperAnalyses,
 }: {
   papers: PaperItem[]
   relations: PaperRelation[]
   allPapers: PaperItem[]
+  constraints: QueryConstraint[]
   traceabilityEnabled: boolean
   paperAnalyses: PaperSemanticAnalysis[]
 }) {
@@ -1172,6 +1160,7 @@ function PaperResultsPanel({
             paper={paper}
             isSelected={selectedPaperId === paper.paper_id}
             onSelect={() => handleSelect(paper.paper_id)}
+            constraints={constraints}
             traceabilityEnabled={traceabilityEnabled}
             semanticAnalysis={paperAnalyses.find((analysis) => analysis.paper_id === paper.paper_id) || null}
             onNavigateToRef={(targetId) => {
@@ -1206,7 +1195,7 @@ function PaperResultsPanel({
 
             <div className="2xl:max-h-[calc(100vh-180px)] overflow-y-auto space-y-3 pr-1">
               {selectedPaper?.deepseek_trace ? (
-                <DeepSeekRecommendationDetail trace={selectedPaper.deepseek_trace} />
+                <DeepSeekRecommendationDetail trace={selectedPaper.deepseek_trace} constraints={constraints} />
               ) : selectedSemanticAnalysis && selectedPaper ? (
                 <SemanticPaperDetail analysis={selectedSemanticAnalysis} paper={selectedPaper} />
               ) : selectedTrace && selectedPaper ? (
@@ -1236,6 +1225,7 @@ function SelectablePaperCard({
   paper,
   isSelected,
   onSelect,
+  constraints,
   traceabilityEnabled,
   semanticAnalysis,
   onNavigateToRef,
@@ -1243,6 +1233,7 @@ function SelectablePaperCard({
   paper: PaperItem
   isSelected: boolean
   onSelect: () => void
+  constraints: QueryConstraint[]
   traceabilityEnabled: boolean
   semanticAnalysis: PaperSemanticAnalysis | null
   onNavigateToRef?: (targetId: string) => void
@@ -1323,7 +1314,6 @@ function SelectablePaperCard({
           <span className="text-gray-500 bg-gray-50 px-2 py-0.5 rounded-md border border-gray-100">引用 {paper.cited_by_count}</span>
         )}
         <span className="text-gray-500 bg-gray-50 px-2 py-0.5 rounded-md border border-gray-100">{paper.source}</span>
-        <span className="text-gray-500 bg-gray-50 px-2 py-0.5 rounded-md border border-gray-100">Depth {paper.depth}</span>
         {paper.selected && (
           <span className="inline-flex items-center gap-0.5 text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-100 font-semibold">
             <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
@@ -1357,50 +1347,35 @@ function SelectablePaperCard({
       </div>
 
       {/* DeepSeek 只解释 Selector 的最终入选结果，不改变 selected/score。 */}
-      {paper.selected && (deepSeekTrace || paper.trace_status) && (
+      {paper.selected && deepSeekTrace && (
         <div className="mt-2.5 rounded-lg border border-sky-100 bg-sky-50/60 px-3 py-2 space-y-2" onClick={(e) => e.stopPropagation()}>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-[11px] font-semibold text-sky-800">AI 推荐分析</span>
-              {deepSeekTrace && (
-                <span className={`text-[10px] rounded border px-1.5 py-0.5 ${
-                  deepSeekTrace.relevance_level === 'high'
-                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                    : deepSeekTrace.relevance_level === 'partial'
-                      ? 'border-amber-200 bg-amber-50 text-amber-700'
-                      : 'border-gray-200 bg-gray-50 text-gray-600'
-                }`}>
-                  {deepSeekTrace.relevance_level === 'high' ? '高度相关' : deepSeekTrace.relevance_level === 'partial' ? '部分相关' : '低相关'}
-                </span>
-              )}
-              <span className={`text-[10px] rounded px-1.5 py-0.5 ${
-                paper.trace_status === 'success'
-                  ? 'bg-emerald-100 text-emerald-700'
-                  : paper.trace_status === 'degraded'
-                    ? 'bg-amber-100 text-amber-700'
-                    : 'bg-gray-100 text-gray-500'
+              <span className={`text-[10px] rounded border px-1.5 py-0.5 ${
+                deepSeekTrace.relevance_level === 'high'
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                  : deepSeekTrace.relevance_level === 'partial'
+                    ? 'border-amber-200 bg-amber-50 text-amber-700'
+                    : 'border-gray-200 bg-gray-50 text-gray-600'
               }`}>
-                {paper.trace_status === 'success' ? 'AI分析完成' : paper.trace_status === 'degraded' ? 'AI暂不可用' : 'AI分析未开启'}
+                {deepSeekTrace.relevance_level === 'high' ? '高度相关' : deepSeekTrace.relevance_level === 'partial' ? '部分相关' : '低相关'}
+              </span>
+              <span className="text-[10px] rounded px-1.5 py-0.5 bg-emerald-100 text-emerald-700">
+                AI分析完成
               </span>
             </div>
-            {deepSeekTrace && (
-              <button
-                type="button"
-                onClick={() => setDeepSeekExpanded((value) => !value)}
-                className="text-[10px] font-medium text-sky-700 hover:text-sky-900"
-              >
-                {deepSeekExpanded ? '收起证据' : '展开条件与证据'}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => setDeepSeekExpanded((value) => !value)}
+              className="text-[10px] font-medium text-sky-700 hover:text-sky-900"
+            >
+              {deepSeekExpanded ? '收起证据' : '展开条件与证据'}
+            </button>
           </div>
 
           <p className="text-[12px] leading-relaxed text-sky-950">
-            {deepSeekTrace?.recommendation_reason
-              || paper.selector_reason
-              || trace?.reasons?.[0]?.text
-              || (paper.trace_status === 'disabled'
-                ? '当前服务未开启 AI 推荐分析；论文仍按原 Selector 结果展示。'
-                : 'AI 分析暂时不可用；论文仍按原 Selector 结果展示。')}
+            {deepSeekTrace.recommendation_reason}
           </p>
 
           {deepSeekExpanded && deepSeekTrace && (
@@ -1414,7 +1389,7 @@ function SelectablePaperCard({
                       {items.map((item) => (
                         <div key={item.constraint_id}>
                           <p className="text-[11px] leading-relaxed">
-                            <span className="font-mono font-bold">{item.constraint_id}</span> · {item.explanation}
+                            <span className="font-bold">{constraintDisplayText(constraints, item.constraint_id)}</span> · {item.explanation}
                           </p>
                           {item.evidence_ids.length > 0 && (
                             <p className="text-[10px] opacity-70">证据：{item.evidence_ids.join('、')}</p>
@@ -1437,7 +1412,7 @@ function SelectablePaperCard({
                           <span>{sourceTypeLabels[item.source_type] || item.source_type}</span>
                           {item.location.sentence_index != null && <span>句 {item.location.sentence_index}</span>}
                           {item.location.section && <span>{item.location.section}</span>}
-                          <span>支持 {item.supports_constraints.join('、')}</span>
+                          <span>支持 {item.supports_constraints.map((id) => constraintDisplayText(constraints, id)).join('、')}</span>
                         </div>
                         <p className="mt-1 text-[11px] leading-relaxed text-gray-700">“{item.exact_text}”</p>
                       </div>
@@ -1659,7 +1634,7 @@ function PaperRelationGraph({
           >
             <span className="line-clamp-2">{findTitle(node.paperId)}</span>
             <span className="mt-0.5 block font-mono text-[8px] text-slate-400">
-              {Math.round(node.relation.confidence * 100)}%
+              关系强度 {(node.relation.confidence * 100).toFixed(1)}%
             </span>
           </button>
         ))}
@@ -1716,7 +1691,21 @@ function RefChip({ label, onClick }: { label: string; onClick: () => void }) {
   )
 }
 
-function DeepSeekRecommendationDetail({ trace }: { trace: DeepSeekTrace }) {
+function constraintDisplayText(constraints: QueryConstraint[], constraintId: string): string {
+  const constraint = constraints.find((item) => item.constraint_id === constraintId)
+  return constraint?.description?.trim()
+    || constraint?.text?.trim()
+    || constraint?.original_text?.trim()
+    || '查询条件'
+}
+
+function DeepSeekRecommendationDetail({
+  trace,
+  constraints,
+}: {
+  trace: DeepSeekTrace
+  constraints: QueryConstraint[]
+}) {
   const relevanceLabels = { high: '高度相关', partial: '部分相关', low: '低相关' }
   const groups = groupDeepSeekResults(trace.constraint_results).filter((group) => group.items.length > 0)
 
@@ -1737,7 +1726,7 @@ function DeepSeekRecommendationDetail({ trace }: { trace: DeepSeekTrace }) {
         <div className="flex flex-wrap gap-1.5">
           {groups.flatMap((group) => group.items.map((item) => (
             <span key={item.constraint_id} className={`rounded-md border px-2 py-1 text-[10px] ${group.className}`} title={item.explanation}>
-              {item.constraint_id} · {group.label.replace('的条件', '')}
+              {group.label.replace('的条件', '')} · {constraintDisplayText(constraints, item.constraint_id)}
             </span>
           )))}
         </div>
@@ -1752,7 +1741,7 @@ function DeepSeekRecommendationDetail({ trace }: { trace: DeepSeekTrace }) {
                 <div className="mb-1 flex items-center gap-1.5 text-[9px] text-slate-400">
                   <span className="font-mono text-sky-700">{item.evidence_id}</span>
                   <span>{sourceTypeLabels[item.source_type] || item.source_type}</span>
-                  <span>→ {item.supports_constraints.join('、')}</span>
+                  <span>→ {item.supports_constraints.map((id) => constraintDisplayText(constraints, id)).join('、')}</span>
                 </div>
                 “{item.exact_text}”
               </blockquote>

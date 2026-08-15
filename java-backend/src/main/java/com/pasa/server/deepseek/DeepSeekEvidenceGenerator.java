@@ -27,6 +27,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class DeepSeekEvidenceGenerator {
@@ -35,6 +37,14 @@ public class DeepSeekEvidenceGenerator {
             "satisfied", "partially_satisfied", "violated", "unknown");
     private static final Set<String> RELEVANCE = Set.of("high", "partial", "low");
     private static final Set<String> SOURCE_TYPES = Set.of("title", "abstract", "metadata", "fulltext");
+    private static final Pattern UNHELPFUL_REASON_CLAUSE = Pattern.compile(
+            "(?i)(无法确认|不能确认|尚无法确认|未能确认|无从确认|未提供|没有提供|"
+                    + "缺少.{0,24}(?:信息|细节|内容|证据)|仅提供.{0,16}(?:标题|摘要)|"
+                    + "cannot be confirmed|cannot confirm|could not be confirmed|"
+                    + "not (?:provided|stated|available)|does not provide|"
+                    + "lack(?:s|ing)? .{0,32}(?:information|details|evidence))");
+    private static final Pattern CONTRAST_TRANSITION = Pattern.compile(
+            "(?i)(?:[；;，,]\s*)?(?:然而|但是|但|不过|可是|although|however|but)\s*[，,]?");
 
     private final DeepSeekEvidenceClient client;
     private final PasaProperties properties;
@@ -308,8 +318,9 @@ public class DeepSeekEvidenceGenerator {
         }
         List<ApiModels.DeepSeekConstraintResult> results = List.copyOf(byConstraint.values());
         String relevance = raw.relevanceLevel();
-        // Keep the model's natural synthesis. Constraint/evidence structures are validated separately.
-        String reason = raw.recommendationReason().strip();
+        // Unknown constraints remain available below as structured results, but repetitive absence
+        // disclaimers add no value to the natural recommendation paragraph.
+        String reason = usefulRecommendationReason(raw.recommendationReason(), paper);
         return new ApiModels.DeepSeekTrace(
                 reason,
                 relevance,
@@ -320,6 +331,35 @@ public class DeepSeekEvidenceGenerator {
                 idsByStatus(results, "violated"),
                 idsByStatus(results, "unknown")
         );
+    }
+
+    static String usefulRecommendationReason(String rawReason, ApiModels.PaperItem paper) {
+        List<String> usefulSentences = new ArrayList<>();
+        for (String rawSentence : text(rawReason).strip().split("(?<=[。！？.!?])")) {
+            String sentence = rawSentence.strip();
+            if (sentence.isBlank()) continue;
+            Matcher unhelpful = UNHELPFUL_REASON_CLAUSE.matcher(sentence);
+            if (!unhelpful.find()) {
+                usefulSentences.add(sentence);
+                continue;
+            }
+
+            int cutoff = -1;
+            Matcher transition = CONTRAST_TRANSITION.matcher(sentence.substring(0, unhelpful.start()));
+            while (transition.find()) cutoff = transition.start();
+            if (cutoff > 0) {
+                String supportedPart = sentence.substring(0, cutoff)
+                        .replaceFirst("[；;，,\\s]+$", "").strip();
+                if (!supportedPart.isBlank()) {
+                    usefulSentences.add(supportedPart.matches(".*[。！？.!?]$")
+                            ? supportedPart : supportedPart + "。");
+                }
+            }
+        }
+        if (!usefulSentences.isEmpty()) {
+            return String.join("", usefulSentences);
+        }
+        return "《" + text(paper.title()).strip() + "》与本次检索主题的具体关联，见下方原文证据与约束判断。";
     }
 
     private boolean validEvidence(

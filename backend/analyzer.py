@@ -80,6 +80,46 @@ def _valid_quote(quote: str, paper: Any) -> bool:
     return bool(normalized_quote) and normalized_quote in source
 
 
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _paper_score(paper: Any) -> float:
+    value = getattr(paper, "selector_score", None)
+    if value is None:
+        value = getattr(paper, "score", 0.5)
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _calibrated_relation_confidence(
+    model_confidence: float,
+    left: Any,
+    right: Any,
+    evidence_from: str,
+    evidence_to: str,
+) -> float:
+    """Blend the model judgment with pair-specific continuous evidence features."""
+    content_similarity = _jaccard(
+        _tokens(f"{left.title} {left.abstract}"),
+        _tokens(f"{right.title} {right.abstract}"),
+    )
+    evidence_similarity = _jaccard(_tokens(evidence_from), _tokens(evidence_to))
+    pair_relevance = (_paper_score(left) + _paper_score(right)) / 2
+    calibrated = (
+        0.25
+        + 0.40 * model_confidence
+        + 0.15 * content_similarity
+        + 0.10 * evidence_similarity
+        + 0.10 * pair_relevance
+    )
+    return min(0.99, max(0.0, calibrated))
+
+
 class SearchResultAnalyzer:
     def __init__(self, agent: Any, settings: Settings) -> None:
         self.agent = agent
@@ -264,9 +304,12 @@ Do not infer citation relationships."""
             if not _valid_quote(evidence_from, left) or not _valid_quote(evidence_to, right):
                 continue
             try:
-                confidence = min(1.0, max(0.0, float(value.get("confidence", 0.7))))
+                model_confidence = min(1.0, max(0.0, float(value.get("confidence", 0.7))))
             except (TypeError, ValueError):
-                confidence = 0.7
+                model_confidence = 0.7
+            confidence = _calibrated_relation_confidence(
+                model_confidence, left, right, evidence_from, evidence_to
+            )
             relations.append(SemanticRelation(
                 relation_id=f"MLR{len(relations) + 1}",
                 from_paper_id=left.paper_id,

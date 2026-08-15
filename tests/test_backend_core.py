@@ -100,6 +100,8 @@ class ResultFormatterTest(unittest.TestCase):
         self.assertIsNotNone(analysis)
         self.assertEqual(2, analysis.analyzed_paper_count)
         self.assertEqual("same_task", analysis.semantic_relations[0].type)
+        self.assertGreater(analysis.semantic_relations[0].confidence, 0)
+        self.assertLess(analysis.semantic_relations[0].confidence, 0.9)
         self.assertIs(analysis, cached)
 
 
