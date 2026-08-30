@@ -73,8 +73,15 @@ public class QueryConstraintParser {
         List<ConstraintValue> values = new ArrayList<>();
         addValue(values, "hard", understanding.path("research_intent").asText(""), query);
         addArray(values, "hard", understanding.path("hard_constraints"), query);
-        addArray(values, "soft", understanding.path("soft_constraints"), query);
-        addArray(values, "exclusion", understanding.path("exclusions"), query);
+        // A planner may suggest useful defaults such as "prefer recent top venues" or invent
+        // exclusions. They are search hints, not user requirements, so expose them as auditable
+        // constraints only when the original query explicitly contains that intent.
+        if (SOFT.matcher(query).find()) {
+            addArray(values, "soft", understanding.path("soft_constraints"), query);
+        }
+        if (EXCLUSION.matcher(query).find()) {
+            addArray(values, "exclusion", understanding.path("exclusions"), query);
+        }
         if (OUTPUT.matcher(query).find()) {
             addArray(values, "output", understanding.path("comparison_dimensions"), query);
         }

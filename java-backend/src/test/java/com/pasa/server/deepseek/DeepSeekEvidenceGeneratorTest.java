@@ -118,6 +118,34 @@ class DeepSeekEvidenceGeneratorTest {
     }
 
     @Test
+    void removesStockOpeningsAndGenericResearchNeedSentences() {
+        String reason = "该论文提出面向鉴别诊断的LLM，并在NEJM真实病例上由20名临床医生评估，"
+                + "显示其辅助诊断准确率显著提升。研究直接涉及LLM在医疗诊断中的模型、评估与挑战，"
+                + "符合用户对最新进展的调研需求。";
+
+        String cleaned = DeepSeekEvidenceGenerator.usefulRecommendationReason(
+                reason, paper("medical", "Differential Diagnosis with LLMs", "Abstract"));
+
+        assertThat(cleaned)
+                .startsWith("面向鉴别诊断的LLM")
+                .contains("NEJM真实病例", "20名临床医生", "准确率显著提升")
+                .doesNotContain("该论文提出", "研究直接涉及", "符合用户", "调研需求");
+    }
+
+    @Test
+    void trimsGenericValueClaimWithoutDiscardingSpecificFinding() {
+        String reason = "OrthoDoc结合RAG模块减少幻觉，并在骨科疾病诊断中超越GPT-4，"
+                + "从而符合用户对最新进展的调研需求。";
+
+        String cleaned = DeepSeekEvidenceGenerator.usefulRecommendationReason(
+                reason, paper("orthodoc", "OrthoDoc", "Abstract"));
+
+        assertThat(cleaned)
+                .isEqualTo("OrthoDoc结合RAG模块减少幻觉，并在骨科疾病诊断中超越GPT-4。")
+                .doesNotContain("符合用户", "调研需求");
+    }
+
+    @Test
     void removesHallucinatedExactTextAndChangesJudgmentToUnknown() {
         DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(traceJson(
                 "high", "该论文讨论定位方法，并声称提供开源代码以回应用户对实现可用性的关注。", result("C1", "satisfied", "E1"),
@@ -193,6 +221,49 @@ class DeepSeekEvidenceGeneratorTest {
         assertThat(batch.papers()).extracting(
                 paper -> paper.deepseekTrace().recommendationReason())
                 .doesNotHaveDuplicates();
+    }
+
+    @Test
+    void acceptsCompactBatchTraceAndDerivesStatusLists() {
+        String compactTrace = "{\"recommendation_reason\":\"该论文提出面向图检索的稠密编码器，并通过联合表示学习改善候选排序，能够直接支撑查询对检索方法的比较。\","
+                + "\"relevance_level\":\"high\",\"constraint_results\":["
+                + result("C1", "satisfied", "E1") + "],\"evidence\":["
+                + evidence("E1", "title", "First Paper", "C1") + "]}";
+        DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(batchJson(
+                batchItem("p1", compactTrace),
+                batchItem("p2", compactTrace.replace("图检索", "排序学习")
+                        .replace("First Paper", "Second Paper")))));
+
+        var papers = generator.enrich("query", constraints("hard"), List.of(
+                paper("p1", "First Paper", "Abstract"),
+                paper("p2", "Second Paper", "Abstract"))).papers();
+
+        assertThat(papers).allSatisfy(paper -> {
+            assertThat(paper.traceStatus()).isEqualTo("success");
+            assertThat(paper.deepseekTrace().satisfiedConstraints()).containsExactly("C1");
+        });
+    }
+
+    @Test
+    void malformedBatchRetryUsesCompactCorrectionPrompt() {
+        AtomicInteger calls = new AtomicInteger();
+        DeepSeekEvidenceGenerator generator = generator((system, user) -> {
+            if (calls.incrementAndGet() == 1) return completion("{");
+            assertThat(user).contains("previous response was not complete JSON", "minimal schema");
+            return completion(batchJson(
+                    batchItem("p1", traceJson("high", "第一篇论文针对编码器结构提出具体改进，能够回应查询对表示学习方法的关注。",
+                            result("C1", "satisfied", "E1"), evidence("E1", "title", "First Paper", "C1"))),
+                    batchItem("p2", traceJson("high", "第二篇论文针对排序目标设计训练策略，能够回应查询对候选排序方法的关注。",
+                            result("C1", "satisfied", "E2"), evidence("E2", "title", "Second Paper", "C1")))));
+        });
+
+        var batch = generator.enrich("query", constraints("hard"), List.of(
+                paper("p1", "First Paper", "Abstract"),
+                paper("p2", "Second Paper", "Abstract")));
+
+        assertThat(calls).hasValue(2);
+        assertThat(batch.papers()).extracting(ApiModels.PaperItem::traceStatus)
+                .containsExactly("success", "success");
     }
 
     @Test

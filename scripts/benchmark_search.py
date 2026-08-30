@@ -243,7 +243,7 @@ def main():
         "--recommendation-analysis",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="enable paid per-paper recommendation analysis (disabled by default for benchmarks)",
+        help="enable one paid batch recommendation request per case (disabled by default for benchmarks)",
     )
     args = parser.parse_args()
 

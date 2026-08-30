@@ -11,7 +11,6 @@ import {
   PaperRelation,
   RelationType,
   PaperItem,
-  PaperSemanticAnalysis,
   SearchAnalysis,
   SearchFormOptions,
   DeepSeekTrace,
@@ -812,7 +811,6 @@ function ConversationMessage({
                     allPapers={result.papers}
                     constraints={result.constraints || []}
                     traceabilityEnabled={result.traceability_enabled ?? false}
-                    paperAnalyses={result.analysis?.paper_analyses || []}
                   />
                 </div>
               )}
@@ -1101,28 +1099,17 @@ function PaperResultsPanel({
   allPapers,
   constraints,
   traceabilityEnabled,
-  paperAnalyses,
 }: {
   papers: PaperItem[]
   relations: PaperRelation[]
   allPapers: PaperItem[]
   constraints: QueryConstraint[]
   traceabilityEnabled: boolean
-  paperAnalyses: PaperSemanticAnalysis[]
 }) {
   const [selectedPaperId, setSelectedPaperId] = useState<string | null>(null)
-  // 跳转定位高亮（constraint-xxx / evidence-xxx）
-  const [highlightId, setHighlightId] = useState<string | null>(null)
-  const highlightTimerRef = useRef<number | null>(null)
-
   const selectedPaper = papers.find((p) => p.paper_id === selectedPaperId) || null
-  const selectedTrace = selectedPaper?.recommendation_trace ?? null
-  const selectedSemanticAnalysis = selectedPaper
-    ? paperAnalyses.find((analysis) => analysis.paper_id === selectedPaper.paper_id) || null
-    : null
-
   const showSidePanels = !!selectedPaper
-    && (traceabilityEnabled || !!selectedSemanticAnalysis || !!selectedPaper.deepseek_trace)
+    && (traceabilityEnabled || !!selectedPaper.deepseek_trace)
 
   const paperRelations = selectedPaper
     ? dedupePaperRelations(relations.filter(
@@ -1138,18 +1125,6 @@ function PaperResultsPanel({
   const handleSelect = (paperId: string) => {
     setSelectedPaperId(selectedPaperId === paperId ? null : paperId)
   }
-
-  // 跳转定位：滚动到目标并短暂高亮
-  const scrollToItem = (id: string) => {
-    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    setHighlightId(id)
-    if (highlightTimerRef.current) window.clearTimeout(highlightTimerRef.current)
-    highlightTimerRef.current = window.setTimeout(() => setHighlightId(null), 1600)
-  }
-
-  useEffect(() => () => {
-    if (highlightTimerRef.current) window.clearTimeout(highlightTimerRef.current)
-  }, [])
 
   return (
     <div className="flex flex-col 2xl:flex-row gap-4 items-stretch 2xl:items-start justify-center">
@@ -1189,13 +1164,6 @@ function PaperResultsPanel({
             isSelected={selectedPaperId === paper.paper_id}
             onSelect={() => handleSelect(paper.paper_id)}
             constraints={constraints}
-            traceabilityEnabled={traceabilityEnabled}
-            semanticAnalysis={paperAnalyses.find((analysis) => analysis.paper_id === paper.paper_id) || null}
-            onNavigateToRef={(targetId) => {
-              // 点击卡片理由中的关联标记：选中该论文并定位到右侧面板对应卡片
-              setSelectedPaperId(paper.paper_id)
-              window.setTimeout(() => scrollToItem(targetId), 120)
-            }}
           />
         ))}
       </div>
@@ -1221,23 +1189,12 @@ function PaperResultsPanel({
               </button>
             </div>
 
-            <div className="2xl:max-h-[calc(100vh-180px)] overflow-y-auto space-y-3 pr-1">
+            <div className="max-h-[calc(100vh-190px)] overflow-y-auto overscroll-contain space-y-3 pr-2 pb-16">
               {selectedPaper?.deepseek_trace ? (
                 <DeepSeekRecommendationDetail trace={selectedPaper.deepseek_trace} constraints={constraints} />
-              ) : selectedSemanticAnalysis && selectedPaper ? (
-                <SemanticPaperDetail analysis={selectedSemanticAnalysis} paper={selectedPaper} />
-              ) : selectedTrace && selectedPaper ? (
-                <>
-                  <TraceDetail
-                    trace={selectedTrace}
-                    highlightId={highlightId}
-                    onNavigate={scrollToItem}
-                    hasFulltext={!!selectedTrace.evidence?.some((e) => e.source_type === 'fulltext')}
-                  />
-                </>
               ) : (
                 <div className="text-xs text-gray-400 bg-gray-50 rounded-xl border border-gray-100 p-4 text-center">
-                  该论文暂无推荐分析
+                  该论文暂未生成通过证据校验的个性化分析
                 </div>
               )}
             </div>
@@ -1254,32 +1211,16 @@ function SelectablePaperCard({
   isSelected,
   onSelect,
   constraints,
-  traceabilityEnabled,
-  semanticAnalysis,
-  onNavigateToRef,
 }: {
   paper: PaperItem
   isSelected: boolean
   onSelect: () => void
   constraints: QueryConstraint[]
-  traceabilityEnabled: boolean
-  semanticAnalysis: PaperSemanticAnalysis | null
-  onNavigateToRef?: (targetId: string) => void
 }) {
   const [expanded, setExpanded] = useState(false)
   const [deepSeekExpanded, setDeepSeekExpanded] = useState(false)
 
-  // 四类约束数量（有追溯结果时统计）
-  const trace = paper.recommendation_trace
   const deepSeekTrace = paper.deepseek_trace
-  const constraintCounts = trace
-    ? [
-        { label: '满足', count: trace.satisfied_constraints?.length || 0, cls: 'text-emerald-700 bg-emerald-50 border-emerald-100' },
-        { label: '部分满足', count: trace.partially_satisfied_constraints?.length || 0, cls: 'text-amber-700 bg-amber-50 border-amber-100' },
-        { label: '未满足', count: trace.violated_constraints?.length || 0, cls: 'text-red-700 bg-red-50 border-red-100' },
-        { label: '尚无法确认', count: trace.unknown_constraints?.length || 0, cls: 'text-gray-600 bg-gray-50 border-gray-200' },
-      ].filter((c) => c.count > 0)
-    : []
 
   const externalUrl = paper.url || paper.arxiv_url || paper.doi || null
   const linkLabel = paper.url ? '查看' : paper.arxiv_url ? 'arXiv' : paper.doi ? 'DOI' : 'Link'
@@ -1454,66 +1395,6 @@ function SelectablePaperCard({
       )}
 
       {/* 推荐理由 + 四类约束数量（仅追溯启用且有追溯结果时显示） */}
-      {!deepSeekTrace && semanticAnalysis && (
-        <div className="mt-2.5 rounded-lg border border-violet-100 bg-violet-50/50 px-3 py-2 space-y-1.5">
-          <p className="text-[12px] leading-relaxed text-violet-900">
-            <span className="font-semibold">论文分析：</span>{semanticAnalysis.one_sentence_summary}
-          </p>
-          {semanticAnalysis.methodology.length > 0 && (
-            <p className="text-[11px] text-violet-700">方法：{semanticAnalysis.methodology.join('、')}</p>
-          )}
-          {semanticAnalysis.key_findings.length > 0 && (
-            <p className="text-[11px] text-gray-600">主要发现：{semanticAnalysis.key_findings.slice(0, 2).join('；')}</p>
-          )}
-          {semanticAnalysis.limitations.length > 0 && (
-            <p className="text-[11px] text-amber-700">局限：{semanticAnalysis.limitations.slice(0, 2).join('；')}</p>
-          )}
-        </div>
-      )}
-
-      {!deepSeekTrace && !semanticAnalysis && traceabilityEnabled && trace && (constraintCounts.length > 0 || (trace.reasons && trace.reasons.length > 0)) && (
-        <div className="mt-2.5 bg-indigo-50/50 border border-indigo-100 rounded-lg px-3 py-2 space-y-1.5">
-          {constraintCounts.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {constraintCounts.map((c) => (
-                <span key={c.label} className={`text-[10px] border rounded px-1.5 py-0.5 ${c.cls}`}>
-                  {c.label} {c.count}
-                </span>
-              ))}
-            </div>
-          )}
-          {(trace.reasons || []).slice(0, 2).map((reason, i) => (
-            <div key={i}>
-              <p className="text-[12px] text-indigo-800 leading-relaxed">
-                <span className="font-semibold">推荐理由{i + 1}：</span>
-                {reason.text}
-              </p>
-              {(reason.constraint_ids?.length > 0 || reason.evidence_ids?.length > 0) && onNavigateToRef && (
-                <div className="mt-1 flex flex-wrap gap-1">
-                  {reason.constraint_ids.map((cid) => (
-                    <RefChip key={`c-${cid}`} label={`约束 ${shortId(cid)}`} onClick={() => onNavigateToRef(`constraint-${cid}`)} />
-                  ))}
-                  {reason.evidence_ids.map((eid) => (
-                    <RefChip key={`e-${eid}`} label={`证据 ${shortId(eid)}`} onClick={() => onNavigateToRef(`evidence-${eid}`)} />
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
-          {(trace.reasons?.length || 0) > 2 && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation()
-                onSelect()
-              }}
-              className="text-[11px] text-indigo-500 hover:text-indigo-700 font-medium transition-colors"
-            >
-              查看全部 {trace.reasons.length} 条理由 →
-            </button>
-          )}
-        </div>
-      )}
-
       {/* Actions */}
       <div className="mt-2 flex items-center justify-between" onClick={(e) => e.stopPropagation()}>
         {hasAbstract ? (
@@ -1682,14 +1563,6 @@ function PaperRelationGraph({
   )
 }
 
-// ===== 四种约束状态颜色（satisfied 绿 / partially_satisfied 黄 / violated 红 / unknown 灰） =====
-const constraintStatusColors: Record<ConstraintStatus, { dot: string; text: string; bg: string; border: string }> = {
-  satisfied: { dot: 'bg-emerald-500', text: 'text-emerald-700', bg: 'bg-emerald-50', border: 'border-emerald-100' },
-  partially_satisfied: { dot: 'bg-amber-500', text: 'text-amber-700', bg: 'bg-amber-50', border: 'border-amber-100' },
-  violated: { dot: 'bg-red-500', text: 'text-red-700', bg: 'bg-red-50', border: 'border-red-100' },
-  unknown: { dot: 'bg-gray-400', text: 'text-gray-600', bg: 'bg-gray-50', border: 'border-gray-200' },
-}
-
 const sourceTypeLabels: Record<string, string> = {
   title: '标题',
   abstract: '摘要',
@@ -1698,12 +1571,17 @@ const sourceTypeLabels: Record<string, string> = {
   citation_database: '引用数据库',
 }
 
-// ===== 短 ID 显示 =====
+const constraintStatusColors: Record<ConstraintStatus, { dot: string; text: string; bg: string; border: string }> = {
+  satisfied: { dot: 'bg-emerald-500', text: 'text-emerald-700', bg: 'bg-emerald-50', border: 'border-emerald-100' },
+  partially_satisfied: { dot: 'bg-amber-500', text: 'text-amber-700', bg: 'bg-amber-50', border: 'border-amber-100' },
+  violated: { dot: 'bg-red-500', text: 'text-red-700', bg: 'bg-red-50', border: 'border-red-100' },
+  unknown: { dot: 'bg-gray-400', text: 'text-gray-600', bg: 'bg-gray-50', border: 'border-gray-200' },
+}
+
 function shortId(id: string): string {
   return id.length > 10 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id
 }
 
-// ===== 引用跳转 chip（理由/约束/证据之间互相定位） =====
 function RefChip({ label, onClick }: { label: string; onClick: () => void }) {
   return (
     <button
@@ -1751,11 +1629,17 @@ function DeepSeekRecommendationDetail({
 
       <section>
         <p className="mb-1.5 text-xs font-bold text-slate-500">查询条件核验</p>
-        <div className="flex flex-wrap gap-1.5">
+        <div className="space-y-1.5">
           {groups.flatMap((group) => group.items.map((item) => (
-            <span key={item.constraint_id} className={`rounded-md border px-2 py-1 text-[10px] ${group.className}`} title={item.explanation}>
-              {group.label.replace('的条件', '')} · {constraintDisplayText(constraints, item.constraint_id)}
-            </span>
+            <div key={item.constraint_id} className={`rounded-lg border px-2.5 py-2 ${group.className}`}>
+              <p className="text-[10px] font-semibold leading-4">
+                {group.label.replace('的条件', '')} · {constraintDisplayText(constraints, item.constraint_id)}
+              </p>
+              <p className="mt-1 text-[11px] leading-5 opacity-90">{item.explanation}</p>
+              {item.evidence_ids.length > 0 && (
+                <p className="mt-1 text-[9px] font-mono opacity-60">证据：{item.evidence_ids.join('、')}</p>
+              )}
+            </div>
           )))}
         </div>
       </section>
@@ -1781,68 +1665,8 @@ function DeepSeekRecommendationDetail({
   )
 }
 
-function SemanticPaperDetail({ analysis, paper }: { analysis: PaperSemanticAnalysis; paper: PaperItem }) {
-  const relevanceLabels = { high: '高度相关', partial: '部分相关', low: '低相关' }
-  const sections = [
-    { title: '采用方法', values: analysis.methodology, style: 'text-violet-700 bg-violet-50 border-violet-100' },
-    { title: '使用数据集', values: analysis.datasets, style: 'text-blue-700 bg-blue-50 border-blue-100' },
-    { title: '主要发现', values: analysis.key_findings, style: 'text-emerald-700 bg-emerald-50 border-emerald-100' },
-    { title: '核心贡献', values: analysis.contributions, style: 'text-indigo-700 bg-indigo-50 border-indigo-100' },
-    { title: '局限性', values: analysis.limitations, style: 'text-amber-700 bg-amber-50 border-amber-100' },
-  ].filter((section) => section.values.length > 0)
-
-  return (
-    <div className="space-y-3">
-      <div className="rounded-xl border border-indigo-100 bg-indigo-50/70 p-3.5">
-        <div className="flex items-center justify-between gap-2 mb-2">
-          <span className="text-xs font-bold text-indigo-700">个性化推荐理由</span>
-          <span className="rounded-full border border-indigo-200 bg-white px-2 py-0.5 text-[10px] text-indigo-600">
-            {relevanceLabels[analysis.relevance_level]}
-          </span>
-        </div>
-        <p className="text-xs leading-6 text-indigo-900">{analysis.one_sentence_summary}</p>
-        {analysis.research_problem && (
-          <p className="mt-2 text-[11px] leading-5 text-gray-600">
-            <span className="font-semibold text-gray-700">对应问题：</span>{analysis.research_problem}
-          </p>
-        )}
-      </div>
-
-      {sections.map((section) => (
-        <div key={section.title}>
-          <p className="mb-1.5 text-xs font-bold text-gray-500">{section.title}</p>
-          <div className="space-y-1.5">
-            {section.values.map((value, index) => (
-              <p key={index} className={`rounded-lg border px-3 py-2 text-[11px] leading-5 ${section.style}`}>
-                {value}
-              </p>
-            ))}
-          </div>
-        </div>
-      ))}
-
-      {analysis.evidence.length > 0 && (
-        <div>
-          <p className="mb-1.5 text-xs font-bold text-gray-500">标题或摘要原文证据</p>
-          <div className="space-y-1.5">
-            {analysis.evidence.map((quote, index) => (
-              <blockquote key={index} className="rounded-lg border border-gray-100 bg-gray-50 px-3 py-2 text-[11px] leading-5 text-gray-600">
-                “{quote}”
-              </blockquote>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <p className="text-[10px] text-gray-400">
-        以上分析仅基于《{paper.title}》当前可用的标题和摘要证据。
-      </p>
-    </div>
-  )
-}
-
 // ===== 推荐分析详情（理由 + 约束 + 证据，支持 constraint_ids / evidence_ids 跳转） =====
-function TraceDetail({
+export function TraceDetail({
   trace,
   highlightId,
   onNavigate,
@@ -1942,10 +1766,10 @@ function ReasonCard({ reason, onNavigate }: { reason: RecommendationReason; onNa
       <p className="text-xs text-indigo-800 leading-relaxed">{reason.text}</p>
       {(reason.constraint_ids?.length > 0 || reason.evidence_ids?.length > 0) && (
         <div className="mt-1.5 flex flex-wrap items-center gap-1">
-          {reason.constraint_ids.map((cid) => (
+          {[...new Set(reason.constraint_ids)].map((cid) => (
             <RefChip key={`c-${cid}`} label={`约束 ${shortId(cid)}`} onClick={() => onNavigate(`constraint-${cid}`)} />
           ))}
-          {reason.evidence_ids.map((eid) => (
+          {[...new Set(reason.evidence_ids)].map((eid) => (
             <RefChip key={`e-${eid}`} label={`证据 ${shortId(eid)}`} onClick={() => onNavigate(`evidence-${eid}`)} />
           ))}
         </div>

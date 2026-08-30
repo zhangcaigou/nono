@@ -8,7 +8,8 @@ from fastapi.testclient import TestClient
 
 from backend.app import create_app
 from backend.analyzer import (
-    SearchResultAnalyzer, _fallback_query_understanding, _fallback_themes, candidate_pairs,
+    SearchResultAnalyzer, _extract_json, _fallback_query_understanding, _fallback_themes,
+    candidate_pairs,
 )
 from backend.config import get_settings
 from backend.engine import MockSearchEngine
@@ -18,6 +19,15 @@ from types import SimpleNamespace
 
 
 class ResultFormatterTest(unittest.TestCase):
+    def test_extract_json_accepts_fenced_output_and_ignores_following_objects(self) -> None:
+        value = _extract_json(
+            '分析如下：```json\n{"direct_answer":"结论","themes":[]}\n```'
+            ' 补充诊断：{"ignored":true}'
+        )
+
+        self.assertEqual("结论", value["direct_answer"])
+        self.assertNotIn("ignored", value)
+
     def test_selector_batch_size_is_bounded_to_a_positive_value(self) -> None:
         self.assertGreaterEqual(get_settings().selector_batch_size, 1)
         self.assertGreaterEqual(get_settings().selector_threshold, 0)

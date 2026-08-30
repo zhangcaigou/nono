@@ -44,6 +44,16 @@ public class DeepSeekEvidenceGenerator {
                     + "lack(?:s|ing)? .{0,32}(?:information|details|evidence))");
     private static final Pattern CONTRAST_TRANSITION = Pattern.compile(
             "(?i)(?:[；;，,]\s*)?(?:然而|但是|但|不过|可是|although|however|but)\s*[，,]?");
+    private static final Pattern GENERIC_RECOMMENDATION_CLAUSE = Pattern.compile(
+            "(?i)(?:[；;，,]\\s*)?(?:(?:因此|从而|因而|所以|这(?:一结果|使其)?|该研究)?\\s*)?"
+                    + "(?:(?:符合|满足|契合|回应)用户.{0,30}(?:需求|目的|关注)|"
+                    + "(?:具有|具备).{0,12}参考价值|"
+                    + "为.{0,30}(?:提供参考|提供思路|提供依据)|"
+                    + "有助于(?:用户)?(?:了解|掌握|调研).{0,30}|"
+                    + "研究(?:直接)?涉及(?:LLM|大语言模型).{0,40}(?:应用|模型|方法|评估|挑战|进展))");
+    private static final Pattern STOCK_RECOMMENDATION_OPENING = Pattern.compile(
+            "^(?:(?:该|这篇)论文|本文|本研究|该研究|该工作|这项工作)\\s*"
+                    + "(?:提出|研究|探讨|介绍|设计|构建|开发|采用|评估|分析|基准测试|聚焦(?:于)?|关注)\\s*");
     private static final Pattern CHINESE_CHARACTER = Pattern.compile("[\\u3400-\\u9fff]");
 
     private final DeepSeekEvidenceClient client;
@@ -251,7 +261,9 @@ public class DeepSeekEvidenceGenerator {
                 DeepSeekEvidenceClient.Completion completion;
                 apiSlots.acquire();
                 try {
-                    completion = client.complete(systemPrompt, userPrompt);
+                    String attemptPrompt = attempt == 1 ? userPrompt : buildCompactRetryPrompt(
+                            originalQuery, constraints, papers);
+                    completion = client.complete(systemPrompt, attemptPrompt);
                 } finally {
                     apiSlots.release();
                 }
@@ -376,16 +388,46 @@ public class DeepSeekEvidenceGenerator {
             payload.put("original_query", originalQuery);
             payload.put("constraints", constraintPayload(constraints));
             payload.put("papers", papers.stream().map(this::paperPayload).toList());
-            return "Audit every paper independently. Return one JSON object exactly in the form "
-                    + "{\"analyses\":[{\"paper_id\":\"the input paper_id\",\"trace\":"
-                    + "<an evidence-v2 object matching the system schema>}]}。"
+            return "Audit every paper independently. Return one compact JSON object exactly in the form "
+                    + "{\"analyses\":[{\"paper_id\":\"input paper_id\",\"trace\":{"
+                    + "\"recommendation_reason\":\"2 concise paper-specific Chinese sentences\","
+                    + "\"relevance_level\":\"high|partial|low\",\"constraint_results\":[],\"evidence\":[]}}]}。"
                     + "Return exactly one analyses entry per input paper and never mix evidence between papers. "
                     + "Every recommendation_reason must describe that paper's own task, concrete method or "
                     + "finding, and its specific value for the query in natural Simplified Chinese; do not reuse "
-                    + "sentence templates across papers.\n"
+                    + "sentence templates across papers. Keep it to 70-140 Chinese characters, each constraint "
+                    + "explanation to one sentence, and at most 3 strongest evidence quotes per paper. Omit the "
+                    + "four derived *_constraints arrays. Do not output Markdown or any text outside JSON.\n"
                     + objectMapper.writeValueAsString(payload);
         } catch (Exception exception) {
             throw new IllegalStateException("Cannot serialize DeepSeek batch prompt", exception);
+        }
+    }
+
+    private String buildCompactRetryPrompt(
+            String originalQuery,
+            List<ApiModels.QueryConstraint> constraints,
+            List<ApiModels.PaperItem> papers
+    ) {
+        try {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("original_query", originalQuery);
+            payload.put("constraints", constraintPayload(constraints));
+            payload.put("papers", papers.stream().map(this::paperPayload).toList());
+            return "The previous response was not complete JSON. Return JSON only, with no Markdown. "
+                    + "Use this minimal schema: {\"analyses\":[{\"paper_id\":\"\",\"trace\":{"
+                    + "\"recommendation_reason\":\"70-140 Chinese characters specific to this paper\","
+                    + "\"relevance_level\":\"high|partial|low\",\"constraint_results\":[{"
+                    + "\"constraint_id\":\"\",\"status\":\"satisfied|partially_satisfied|violated|unknown\","
+                    + "\"explanation\":\"one Chinese sentence\",\"evidence_ids\":[],\"confidence\":0.0}],"
+                    + "\"evidence\":[{\"evidence_id\":\"\",\"source_type\":\"title|abstract|metadata\","
+                    + "\"exact_text\":\"exact quote\",\"supports_constraints\":[],\"confidence\":0.0}]}}]}. "
+                    + "Return every input paper once, at most 3 evidence items per paper, and omit all other "
+                    + "fields. Every recommendation must name the paper's concrete method, design or finding "
+                    + "and explain its value for the query. INPUT:\n"
+                    + objectMapper.writeValueAsString(payload);
+        } catch (Exception exception) {
+            throw new IllegalStateException("Cannot serialize compact DeepSeek retry prompt", exception);
         }
     }
 
@@ -416,7 +458,7 @@ public class DeepSeekEvidenceGenerator {
         Map<String, Object> value = new LinkedHashMap<>();
         value.put("paper_id", paper.paperId());
         value.put("title", text(paper.title()));
-        value.put("abstract", text(paper.abstractText()));
+        value.put("abstract", compactAbstract(paper.abstractText()));
         value.put("metadata", metadata);
         value.put("selector", selector);
         value.put("fulltext_excerpts", List.of());
@@ -434,9 +476,7 @@ public class DeepSeekEvidenceGenerator {
         }
         if (text(raw.recommendationReason()).isBlank()
                 || !RELEVANCE.contains(raw.relevanceLevel())
-                || raw.constraintResults() == null || raw.evidence() == null
-                || raw.satisfiedConstraints() == null || raw.partiallySatisfiedConstraints() == null
-                || raw.violatedConstraints() == null || raw.unknownConstraints() == null) {
+                || raw.constraintResults() == null || raw.evidence() == null) {
             throw new IllegalArgumentException("DeepSeek trace does not conform to evidence-v1 schema");
         }
         Set<String> allowedConstraints = constraints.stream()
@@ -512,7 +552,8 @@ public class DeepSeekEvidenceGenerator {
     static String usefulRecommendationReason(String rawReason, ApiModels.PaperItem paper) {
         List<String> usefulSentences = new ArrayList<>();
         for (String rawSentence : text(rawReason).strip().split("(?<=[。！？.!?])")) {
-            String sentence = rawSentence.strip();
+            String sentence = STOCK_RECOMMENDATION_OPENING.matcher(rawSentence.strip())
+                    .replaceFirst("").strip();
             if (sentence.isBlank()) continue;
             Matcher unhelpful = UNHELPFUL_REASON_CLAUSE.matcher(sentence);
             if (!unhelpful.find()) {
@@ -532,8 +573,23 @@ public class DeepSeekEvidenceGenerator {
                 }
             }
         }
-        if (!usefulSentences.isEmpty()) {
-            String result = String.join("", usefulSentences);
+        List<String> specificSentences = new ArrayList<>();
+        for (String sentence : usefulSentences) {
+            Matcher generic = GENERIC_RECOMMENDATION_CLAUSE.matcher(sentence);
+            if (!generic.find()) {
+                specificSentences.add(sentence);
+                continue;
+            }
+            if (generic.start() > 0) {
+                String supportedPart = sentence.substring(0, generic.start())
+                        .replaceFirst("[；;，,。.!?！？\\s]+$", "").strip();
+                if (!supportedPart.isBlank()) {
+                    specificSentences.add(supportedPart + "。");
+                }
+            }
+        }
+        if (!specificSentences.isEmpty()) {
+            String result = String.join("", specificSentences);
             if (hasSubstantialChinese(result)) {
                 return result;
             }
@@ -545,8 +601,19 @@ public class DeepSeekEvidenceGenerator {
         String reason = text(value).strip();
         if (!hasSubstantialChinese(reason) || chineseCharacterCount(reason) < 18) return false;
         return !reason.contains("与本次检索主题的具体关联，见下方原文证据")
+                && !reason.matches(".*该论文围绕《.*》所指向的研究任务展开.*")
+                && !reason.matches(".*研究《.*》所涉及的核心问题.*")
+                && !reason.contains("具体表述见原文证据")
+                && !reason.contains("具体结论见原文证据")
+                && !GENERIC_RECOMMENDATION_CLAUSE.matcher(reason).find()
+                && !STOCK_RECOMMENDATION_OPENING.matcher(reason).find()
                 && !Set.of("与检索主题相关。", "具有参考价值。", "值得关注。")
                 .contains(reason);
+    }
+
+    private static String compactAbstract(String value) {
+        String abstractText = text(value).strip();
+        return abstractText.length() <= 1800 ? abstractText : abstractText.substring(0, 1800);
     }
 
     private static boolean hasSubstantialChinese(String value) {

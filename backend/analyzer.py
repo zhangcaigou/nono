@@ -225,13 +225,26 @@ log = logging.getLogger(__name__)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("model response does not contain a JSON object")
-    value = json.loads(text[start:end + 1])
-    if not isinstance(value, dict):
-        raise ValueError("model response JSON must be an object")
-    return value
+    """Return the first complete JSON object from a model response.
+
+    Local models occasionally append prose, a second diagnostic object, or a
+    Markdown fence after an otherwise valid answer.  Decoding from every object
+    boundary avoids joining those fragments into one invalid JSON document.
+    """
+    decoder = json.JSONDecoder()
+    last_error: json.JSONDecodeError | None = None
+    source = str(text or "")
+    for match in re.finditer(r"\{", source):
+        try:
+            value, _end = decoder.raw_decode(source[match.start():])
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(value, dict):
+            return value
+    if last_error is not None:
+        raise last_error
+    raise ValueError("model response does not contain a JSON object")
 
 
 def _tokens(text: str) -> set[str]:

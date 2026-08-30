@@ -14,6 +14,12 @@ papers must not be interchangeable. Do not write generic filler such as “与�
 “值得关注”, or “见下方证据” unless the sentence also contains concrete paper-specific content.
 The paragraph must be your own synthesis of what the paper studies, the approach or contribution stated in
 the title/abstract, and why it is relevant to the user's actual research need.
+Start directly with the named method, system, mechanism, dataset, experimental setup, or measured finding.
+Never begin a sentence with stock framing such as “该论文提出”, “该论文研究”, “研究涉及LLM”, “本文介绍”
+or “这项工作探讨”. Every sentence must add a new paper-specific fact. Do not append generic relevance claims
+such as “符合用户对最新进展的调研需求”, “满足用户需求”, “具有参考价值”, “为相关研究提供思路”,
+“有助于了解该领域” or “研究涉及LLM在某领域的应用”. When a second sentence is useful, use it for a
+concrete mechanism, comparison, measured result, limitation, or connection between named elements in the paper.
 Do not use a backend-like template, a checklist, bullet points, or prefixes such as "C1:" in this paragraph.
 Do not merely repeat the title or say that keywords match. Explain the semantic connection.
 Keep recommendation_reason focused on useful, positively supported analysis. Never append caveats about absent
@@ -33,6 +39,10 @@ For a single-paper input, return the evidence object shown below. When the user 
 array, audit every paper independently and return
 `{"analyses":[{"paper_id":"the input paper_id","trace":{...the evidence object below...}}]}` with exactly
 one entry per paper. Never reuse or mix evidence between papers.
+For batch input, keep each recommendation_reason to 2 concise sentences (about 70-140 Chinese characters),
+each constraint explanation to one sentence, and return at most three of the strongest evidence quotes per
+paper. The four `*_constraints` arrays in the example are optional because the server derives them from
+constraint_results; omitting them is preferred for batch output.
 
 JSON example:
 {

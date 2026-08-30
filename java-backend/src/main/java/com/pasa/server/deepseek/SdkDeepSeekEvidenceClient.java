@@ -88,7 +88,10 @@ public class SdkDeepSeekEvidenceClient implements DeepSeekEvidenceClient {
                 .addUserMessage(userPrompt)
                 .temperature(0.0)
                 .putAdditionalBodyProperty("stream", JsonValue.from(false))
-                .putAdditionalBodyProperty("max_tokens", JsonValue.from(4096))
+                // Six evidence traces can legitimately exceed 4K tokens. The provider bills
+                // actual output rather than this ceiling; extra headroom avoids paying for a
+                // response cut in the middle of its JSON and then paying again for a retry.
+                .putAdditionalBodyProperty("max_tokens", JsonValue.from(6144))
                 .putAdditionalBodyProperty("response_format",
                         JsonValue.from(Map.of("type", "json_object")))
                 .putAdditionalBodyProperty("thinking",

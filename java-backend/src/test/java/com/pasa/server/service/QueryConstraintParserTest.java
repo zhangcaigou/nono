@@ -37,8 +37,27 @@ class QueryConstraintParserTest {
 
         assertThat(constraints).extracting(value -> value.description()).containsExactly(
                 "研究 AI Agent 在复杂任务规划中的能力边界",
-                "长时程规划", "约束遵循", "优先实证研究", "排除综述", "性能");
+                "长时程规划", "约束遵循", "排除综述", "性能");
         assertThat(constraints).extracting(value -> value.type()).containsExactly(
-                "hard", "hard", "hard", "soft", "exclusion", "output");
+                "hard", "hard", "hard", "exclusion", "output");
+    }
+
+    @Test
+    void doesNotExposePlannerInventedPreferencesOrExclusions() throws Exception {
+        var analysis = new ObjectMapper().readTree("""
+                {"query_understanding":{
+                  "research_intent":"研究隐私保护联邦学习",
+                  "hard_constraints":["必须涉及联邦学习","必须涉及隐私保护"],
+                  "soft_constraints":["优先近五年","优先顶级会议"],
+                  "exclusions":["排除非联邦学习","排除无隐私保护方法"]
+                }}
+                """);
+
+        var constraints = new QueryConstraintParser().parseAnalysis(
+                analysis, "联邦学习在隐私保护下的分布式训练", null);
+
+        assertThat(constraints).extracting(value -> value.description()).containsExactly(
+                "研究隐私保护联邦学习", "必须涉及联邦学习", "必须涉及隐私保护");
+        assertThat(constraints).allMatch(value -> value.type().equals("hard"));
     }
 }
