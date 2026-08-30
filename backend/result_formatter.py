@@ -25,6 +25,41 @@ def _excluded_publication_type(query: str, title: str) -> bool:
     )
 
 
+def _merge_duplicate_identity(preferred: PaperItem, other: PaperItem) -> PaperItem:
+    """Keep the stronger record while preserving cross-provider identifiers.
+
+    Retrieval providers often return the same paper with complementary metadata:
+    OpenAlex commonly has citation/venue fields while the local PaSa corpus has the
+    official arXiv id.  Losing the latter makes a correct result look like a false
+    negative in the competition evaluator, so identity fields must survive title
+    deduplication regardless of which provider has the higher selector score.
+    """
+    arxiv_id = preferred.arxiv_id or other.arxiv_id
+    arxiv_url = preferred.arxiv_url or other.arxiv_url
+    if arxiv_id:
+        arxiv_url = arxiv_url or f"https://arxiv.org/abs/{arxiv_id}"
+    openalex_id = preferred.openalex_id or other.openalex_id
+    doi = preferred.doi or other.doi
+    retrieval_providers = list(dict.fromkeys(
+        [*preferred.retrieval_providers, *other.retrieval_providers]
+    ))
+    authors = preferred.authors or other.authors
+    return preferred.model_copy(update={
+        "paper_id": f"arxiv:{arxiv_id}" if arxiv_id else preferred.paper_id,
+        "arxiv_id": arxiv_id,
+        "arxiv_url": arxiv_url,
+        "url": arxiv_url or preferred.url or other.url,
+        "openalex_id": openalex_id,
+        "doi": doi,
+        "publication_year": preferred.publication_year or other.publication_year,
+        "publication_date": preferred.publication_date or other.publication_date,
+        "venue": preferred.venue or other.venue,
+        "cited_by_count": max(preferred.cited_by_count, other.cited_by_count),
+        "authors": authors,
+        "retrieval_providers": retrieval_providers,
+    })
+
+
 def format_result(request_id: str, query: str, tree: dict[str, Any]) -> ModelSearchResponse:
     """Convert the recursive core result into a stable list plus the original tree."""
     queue: list[dict[str, Any]] = [tree]
@@ -75,8 +110,12 @@ def format_result(request_id: str, query: str, tree: dict[str, Any]) -> ModelSea
                     retrieval_providers=list(extra.get("retrieval_providers") or []),
                 )
                 previous = best_by_key.get(key)
-                if previous is None or item.score > previous.score:
+                if previous is None:
                     best_by_key[key] = item
+                elif item.score > previous.score:
+                    best_by_key[key] = _merge_duplicate_identity(item, previous)
+                else:
+                    best_by_key[key] = _merge_duplicate_identity(previous, item)
 
     papers = sorted(best_by_key.values(), key=lambda item: item.score, reverse=True)
     return ModelSearchResponse(

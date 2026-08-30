@@ -102,6 +102,37 @@ class ResultFormatterTest(unittest.TestCase):
         self.assertEqual(1, result.summary.paper_count)
         self.assertEqual("2012.02190", result.papers[0].arxiv_id)
 
+    def test_cross_provider_dedup_preserves_arxiv_identity_from_lower_scored_record(self) -> None:
+        tree = {"child": {"query": [
+            {
+                "arxiv_id": "", "title": "Fully Convolutional Networks for Semantic Segmentation",
+                "abstract": "openalex has the stronger metadata", "select_score": 0.99,
+                "depth": 0, "source": "SearchFrom:openalex",
+                "extra": {
+                    "openalex_id": "W2395611524", "cited_by_count": 50000,
+                    "retrieval_providers": ["openalex"],
+                }, "child": {},
+            },
+            {
+                "arxiv_id": "1411.4038", "title": "Fully Convolutional Networks for Semantic Segmentation",
+                "abstract": "local corpus record", "select_score": 0.75,
+                "depth": 0, "source": "SearchFrom:local_paper_db",
+                "extra": {"retrieval_providers": ["local_paper_db"]}, "child": {},
+            },
+        ]}}
+
+        result = format_result("request", "query", tree)
+
+        self.assertEqual(1, result.summary.paper_count)
+        self.assertEqual("openalex has the stronger metadata", result.papers[0].abstract)
+        self.assertEqual("1411.4038", result.papers[0].arxiv_id)
+        self.assertEqual("arxiv:1411.4038", result.papers[0].paper_id)
+        self.assertEqual("W2395611524", result.papers[0].openalex_id)
+        self.assertEqual(50000, result.papers[0].cited_by_count)
+        self.assertEqual(
+            ["openalex", "local_paper_db"], result.papers[0].retrieval_providers,
+        )
+
     def test_theme_rules_cover_known_domains_and_dynamically_name_long_tail_topics(self) -> None:
         papers = [
             SimpleNamespace(

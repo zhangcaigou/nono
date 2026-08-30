@@ -22,7 +22,7 @@ import {
   cancelTask,
   createSearchTask,
 } from '@/api/search'
-import { stageToChinese, formatTime, calcDuration, formatElapsedDuration, scoreToPercent } from '@/utils/format'
+import { formatTime, calcDuration, formatElapsedDuration, scoreToPercent } from '@/utils/format'
 import { groupDeepSeekResults } from '@/utils/deepseek'
 import ChatInput from '@/components/ChatInput'
 
@@ -643,20 +643,6 @@ function ConversationMessage({
                     </div>
                   )
                 })}
-              </div>
-
-              {/* 不确定进度动画条 */}
-              <div className="relative">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="relative flex h-2.5 w-2.5">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75" />
-                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-indigo-500" />
-                  </span>
-                  <span className="text-sm font-medium text-gray-700">{stageToChinese(task.stage)}</span>
-                </div>
-                <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
-                  <div className="h-full rounded-full bg-gradient-to-r from-indigo-500 via-purple-500 to-indigo-500 animate-indeterminate" />
-                </div>
               </div>
 
               {/* 实时统计 */}
