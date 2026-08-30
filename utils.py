@@ -21,14 +21,18 @@ Please note that:
 """
 import re
 import bs4
+import copy
 import json
 import os
 import arxiv
+import sqlite3
 import urllib
 import zipfile
 import warnings
 import requests
 import time
+import threading
+from functools import lru_cache
 from pathlib import Path
 from datetime   import datetime
 warnings.simplefilter("always")
@@ -40,11 +44,23 @@ OPENALEX_API_URL = "https://api.openalex.org/works"
 arxiv_client = arxiv.Client(delay_seconds = 0.05)
 paper_id_path = Path(os.getenv("PASA_PAPER_ID_PATH", PROJECT_ROOT / "data/paper_database/id2paper.json"))
 paper_db_path = Path(os.getenv("PASA_PAPER_DB_PATH", PROJECT_ROOT / "data/paper_database/cs_paper_2nd.zip"))
+title_index_path = Path(os.getenv(
+    "PASA_TITLE_INDEX_PATH", PROJECT_ROOT / "data/paper_database/title_index.sqlite3"
+))
 with paper_id_path.open(encoding="utf-8") as paper_id_file:
     id2paper = json.load(paper_id_file)
 paper_db     = zipfile.ZipFile(paper_db_path, "r")
+paper_db_names = set(paper_db.namelist())
+serper_concurrency = max(1, int(os.getenv("PASA_SERPER_CONCURRENCY", "2")))
+serper_semaphore = threading.BoundedSemaphore(serper_concurrency)
+TITLE_QUERY_STOP_WORDS = {
+    "a", "all", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "give", "in", "is", "list", "me", "of", "on", "or", "paper", "papers",
+    "provide", "research", "show", "some", "study", "studies", "that", "the",
+    "to", "use", "using", "which", "with", "about",
+}
 
-def google_search_arxiv_id(query, num=10, end_date=None):
+def _google_search_arxiv_id_uncached(query, num=10, end_date=None):
     if not GOOGLE_KEY:
         raise RuntimeError("SERPER_API_KEY is not configured")
 
@@ -69,9 +85,10 @@ def google_search_arxiv_id(query, num=10, end_date=None):
         'Content-Type': 'application/json'
     }
     last_error = None
-    for _ in range(3):
+    for attempt in range(3):
         try:
-            response = requests.request("POST", url, headers=headers, data=payload, timeout=30)
+            with serper_semaphore:
+                response = requests.request("POST", url, headers=headers, data=payload, timeout=30)
             if response.status_code == 200:
                 results = json.loads(response.text)
                 arxiv_id_list = []
@@ -85,7 +102,19 @@ def google_search_arxiv_id(query, num=10, end_date=None):
         except (requests.RequestException, ValueError, TypeError) as exc:
             last_error = exc
         warnings.warn(f"google search failed, query: {query}: {last_error}")
+        if attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
     raise RuntimeError(f"Serper search failed after 3 attempts: {last_error}")
+
+
+@lru_cache(maxsize=256)
+def _cached_google_search_arxiv_id(query, num, end_date):
+    return tuple(_google_search_arxiv_id_uncached(query, num, end_date))
+
+
+def google_search_arxiv_id(query, num=10, end_date=None):
+    """Search Serper with a process-local cache for repeated query plans."""
+    return list(_cached_google_search_arxiv_id(query, int(num), end_date))
 
 
 def _openalex_abstract(inverted_index):
@@ -116,7 +145,51 @@ def _openalex_arxiv_id(ids, *fallback_values):
     return ""
 
 
-def openalex_search_papers(query, num=10, end_date=None):
+OPENALEX_WORK_SELECT = (
+    "id,doi,title,display_name,publication_year,publication_date,"
+    "primary_location,ids,cited_by_count,authorships,abstract_inverted_index"
+)
+
+
+def _normalize_openalex_work(work):
+    title = str(work.get("title") or work.get("display_name") or "").strip()
+    if not title:
+        return None
+    openalex_url = str(work.get("id") or "")
+    openalex_id = openalex_url.rstrip("/").split("/")[-1]
+    primary_location = work.get("primary_location") or {}
+    source = primary_location.get("source") or {}
+    authors = []
+    for authorship in work.get("authorships") or []:
+        author = authorship.get("author") or {}
+        name = str(author.get("display_name") or "").strip()
+        if name:
+            authors.append(name)
+    landing_url = str(primary_location.get("landing_page_url") or "")
+    arxiv_id = _openalex_arxiv_id(work.get("ids"), work.get("doi"), landing_url)
+    return {
+        "paper_id": f"arxiv:{arxiv_id}" if arxiv_id else f"openalex:{openalex_id}",
+        "arxiv_id": arxiv_id,
+        "title": title,
+        "abstract": _openalex_abstract(work.get("abstract_inverted_index")),
+        "sections": "",
+        "source": "SearchFrom:openalex",
+        "extra": {
+            "retrieval_providers": ["openalex"],
+            "openalex_id": openalex_id,
+            "openalex_url": openalex_url,
+            "doi": str(work.get("doi") or ""),
+            "publication_year": work.get("publication_year"),
+            "publication_date": str(work.get("publication_date") or ""),
+            "venue": str(source.get("display_name") or ""),
+            "cited_by_count": int(work.get("cited_by_count") or 0),
+            "authors": authors,
+            "landing_page_url": landing_url or openalex_url,
+        },
+    }
+
+
+def _openalex_search_papers_uncached(query, num=10, end_date=None):
     """Search OpenAlex and normalize works into PaSa's internal paper format."""
     if not OPENALEX_API_KEY:
         raise RuntimeError("OPENALEX_API_KEY is not configured")
@@ -125,10 +198,7 @@ def openalex_search_papers(query, num=10, end_date=None):
         "api_key": OPENALEX_API_KEY,
         "search": query,
         "per-page": max(1, min(int(num), 100)),
-        "select": (
-            "id,doi,title,display_name,publication_year,publication_date,"
-            "primary_location,ids,cited_by_count,authorships,abstract_inverted_index"
-        ),
+        "select": OPENALEX_WORK_SELECT,
     }
     if end_date:
         try:
@@ -144,49 +214,25 @@ def openalex_search_papers(query, num=10, end_date=None):
                 payload = response.json()
                 papers = []
                 for work in payload.get("results", []):
-                    title = str(work.get("title") or work.get("display_name") or "").strip()
-                    if not title:
-                        continue
-                    openalex_url = str(work.get("id") or "")
-                    openalex_id = openalex_url.rstrip("/").split("/")[-1]
-                    primary_location = work.get("primary_location") or {}
-                    source = primary_location.get("source") or {}
-                    authors = []
-                    for authorship in work.get("authorships") or []:
-                        author = authorship.get("author") or {}
-                        name = str(author.get("display_name") or "").strip()
-                        if name:
-                            authors.append(name)
-                    landing_url = str(primary_location.get("landing_page_url") or "")
-                    arxiv_id = _openalex_arxiv_id(
-                        work.get("ids"), work.get("doi"), landing_url
-                    )
-                    papers.append({
-                        "paper_id": f"arxiv:{arxiv_id}" if arxiv_id else f"openalex:{openalex_id}",
-                        "arxiv_id": arxiv_id,
-                        "title": title,
-                        "abstract": _openalex_abstract(work.get("abstract_inverted_index")),
-                        "sections": "",
-                        "source": "SearchFrom:openalex",
-                        "extra": {
-                            "retrieval_providers": ["openalex"],
-                            "openalex_id": openalex_id,
-                            "openalex_url": openalex_url,
-                            "doi": str(work.get("doi") or ""),
-                            "publication_year": work.get("publication_year"),
-                            "publication_date": str(work.get("publication_date") or ""),
-                            "venue": str(source.get("display_name") or ""),
-                            "cited_by_count": int(work.get("cited_by_count") or 0),
-                            "authors": authors,
-                            "landing_page_url": landing_url or openalex_url,
-                        },
-                    })
+                    paper = _normalize_openalex_work(work)
+                    if paper is not None:
+                        papers.append(paper)
                 return papers
         except (requests.RequestException, ValueError, TypeError):
             pass
         if attempt < 2:
             time.sleep(attempt + 1)
     raise RuntimeError("OpenAlex search failed after 3 attempts")
+
+
+@lru_cache(maxsize=256)
+def _cached_openalex_search_papers(query, num, end_date):
+    return tuple(_openalex_search_papers_uncached(query, num, end_date))
+
+
+def openalex_search_papers(query, num=10, end_date=None):
+    """Search OpenAlex while protecting cached values from caller mutation."""
+    return copy.deepcopy(list(_cached_openalex_search_papers(query, int(num), end_date)))
 
 def parse_metadata(metas):
     """
@@ -360,7 +406,7 @@ def parse_html(html_file):
     }
     return document 
 
-def search_section_by_arxiv_id(entry_id, cite):
+def _search_section_by_arxiv_id_uncached(entry_id, cite):
     warnings.warn("Using search_section_by_arxiv_id function may return wrong title because ar5iv parsing citation error. To solve this, You can prompt any LLM to extract the paper title from the reference string")
     assert re.match(r'^\d+\.\d+$', entry_id)
     url = f'https://ar5iv.labs.arxiv.org/html/{entry_id}'
@@ -405,29 +451,60 @@ def search_section_by_arxiv_id(entry_id, cite):
         warnings.warn(f"An error occurred: {e}")
         return None
 
+
+@lru_cache(maxsize=512)
+def _cached_search_section_by_arxiv_id(entry_id, cite):
+    return _search_section_by_arxiv_id_uncached(entry_id, cite)
+
+
+def search_section_by_arxiv_id(entry_id, cite):
+    return copy.deepcopy(_cached_search_section_by_arxiv_id(entry_id, cite))
+
 def keep_letters(s):
     letters = [c for c in s if c.isalpha()]
     result = ''.join(letters)
     return result.lower()
 
-def search_paper_by_arxiv_id(arxiv_id):
+def _local_paper_by_arxiv_id(arxiv_id):
+    """Resolve an arXiv paper from the bundled database without network access."""
+    if arxiv_id not in id2paper:
+        return None
+    title_key = keep_letters(id2paper[arxiv_id])
+    if title_key not in paper_db_names:
+        return None
+    with paper_db.open(title_key) as source:
+        data = json.loads(source.read().decode("utf-8"))
+    return {
+        "arxiv_id": arxiv_id,
+        "title": data["title"].replace("\n", " "),
+        "abstract": data["abstract"],
+        "sections": data["sections"],
+        "source": "SearchFrom:local_paper_db",
+    }
+
+
+def _arxiv_result_to_paper(result, expected_ids=None):
+    entry_id = result.entry_id.split("/")[-1].split("v")[0]
+    if expected_ids is not None and entry_id not in expected_ids:
+        return None
+    return {
+        "arxiv_id": entry_id,
+        "title": result.title.replace("\n", " "),
+        "abstract": result.summary.replace("\n", " "),
+        "sections": "",
+        "source": "SearchFrom:arxiv",
+    }
+
+
+def _search_paper_by_arxiv_id_uncached(arxiv_id):
     """
     Search paper by arxiv id.
     :param arxiv_id: arxiv id of the paper
     :return: paper list
     """
-    if arxiv_id in id2paper:
-        title_key = keep_letters(id2paper[arxiv_id])
-        if title_key in paper_db.namelist():
-            with paper_db.open(title_key) as f:
-                data = json.loads(f.read().decode("utf-8"))
-            return {
-                "arxiv_id": arxiv_id,
-                "title": data["title"].replace("\n", " "),
-                "abstract": data["abstract"],
-                "sections": data["sections"],
-                "source": 'SearchFrom:local_paper_db',
-            }
+    local = _local_paper_by_arxiv_id(arxiv_id)
+    if local is not None:
+        return local
 
     search = arxiv.Search(
         query = "",
@@ -443,21 +520,140 @@ def search_paper_by_arxiv_id(arxiv_id):
         warnings.warn(f"Failed to search arxiv id: {arxiv_id}")
         return None
 
-    res = None
-    for arxiv_id_result in results:
-        entry_id = arxiv_id_result.entry_id.split("/")[-1]
-        entry_id = entry_id.split('v')[0]
-        if entry_id == arxiv_id:
-            res = {
-                "arxiv_id": arxiv_id,
-                "title": arxiv_id_result.title.replace("\n", " "),
-                "abstract": arxiv_id_result.summary.replace("\n", " "),
-                "sections": "",
-                "source": 'SearchFrom:arxiv',
-            }
+    for arxiv_result in results:
+        paper = _arxiv_result_to_paper(arxiv_result, {arxiv_id})
+        if paper is not None:
+            return paper
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _cached_search_paper_by_arxiv_id(arxiv_id):
+    return _search_paper_by_arxiv_id_uncached(arxiv_id)
+
+
+def search_paper_by_arxiv_id(arxiv_id):
+    """Resolve paper metadata once per model-service process."""
+    return copy.deepcopy(_cached_search_paper_by_arxiv_id(arxiv_id))
+
+
+def _search_papers_by_arxiv_ids_uncached(arxiv_ids):
+    """Resolve a Serper page locally, then batch missing IDs through OpenAlex DOI."""
+    normalized = list(dict.fromkeys(str(item).split("v")[0] for item in arxiv_ids if item))
+    resolved = {}
+    missing = []
+    for arxiv_id in normalized:
+        local = _local_paper_by_arxiv_id(arxiv_id)
+        if local is not None:
+            resolved[arxiv_id] = local
+        else:
+            missing.append(arxiv_id)
+
+    if missing:
+        try:
+            dois = "|".join(f"10.48550/arxiv.{arxiv_id}" for arxiv_id in missing)
+            response = requests.get(
+                OPENALEX_API_URL,
+                params={
+                    "api_key": OPENALEX_API_KEY,
+                    "filter": f"doi:{dois}",
+                    "per-page": min(len(missing), 100),
+                    "select": OPENALEX_WORK_SELECT,
+                },
+                timeout=15,
+            )
+            if response.status_code == 200:
+                for work in response.json().get("results", []):
+                    paper = _normalize_openalex_work(work)
+                    if paper is not None and paper["arxiv_id"] in missing:
+                        paper["extra"]["retrieval_providers"] = ["serper", "openalex_metadata"]
+                        resolved[paper["arxiv_id"]] = paper
+            else:
+                warnings.warn(f"OpenAlex DOI batch returned HTTP {response.status_code}")
+        except Exception as error:
+            warnings.warn(f"Failed to resolve {len(missing)} arxiv ids via OpenAlex DOI: {error}")
+    return [resolved[arxiv_id] for arxiv_id in normalized if arxiv_id in resolved]
+
+
+@lru_cache(maxsize=512)
+def _cached_search_papers_by_arxiv_ids(arxiv_ids):
+    return tuple(_search_papers_by_arxiv_ids_uncached(arxiv_ids))
+
+
+def search_papers_by_arxiv_ids(arxiv_ids):
+    return copy.deepcopy(list(_cached_search_papers_by_arxiv_ids(tuple(arxiv_ids))))
+
+
+def _title_index_match(query):
+    terms = list(dict.fromkeys(
+        token for token in re.findall(r"[a-z0-9]+", query.lower())
+        if len(token) > 1 and token not in TITLE_QUERY_STOP_WORDS
+    ))
+    return " OR ".join(f'"{term}"' for term in terms)
+
+
+def _arxiv_not_after(arxiv_id, end_date):
+    """Apply a conservative month-level cutoff when the bundled DB has no date field."""
+    if not end_date:
+        return True
+    match = re.fullmatch(r"(\d{2})(\d{2})\.\d+", str(arxiv_id or ""))
+    if not match:
+        return True
+    try:
+        cutoff = datetime.strptime(str(end_date), "%Y%m%d")
+    except (TypeError, ValueError):
+        return True
+    paper_year = 2000 + int(match.group(1))
+    paper_month = int(match.group(2))
+    return (paper_year, paper_month) <= (cutoff.year, cutoff.month)
+
+
+def _search_papers_by_title_index_uncached(query, num, end_date=None):
+    if num <= 0 or not title_index_path.exists():
+        return []
+    match = _title_index_match(query)
+    if not match:
+        return []
+    uri = f"file:{title_index_path}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=2)
+    try:
+        rows = connection.execute(
+            "SELECT arxiv_id, title, bm25(paper_titles) AS score "
+            "FROM paper_titles WHERE paper_titles MATCH ? "
+            "ORDER BY score LIMIT ?",
+            (match, max(int(num), int(num) * 3)),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    papers = []
+    for rank, (arxiv_id, title, bm25_score) in enumerate(rows, 1):
+        if not _arxiv_not_after(arxiv_id, end_date):
+            continue
+        paper = _local_paper_by_arxiv_id(arxiv_id)
+        if paper is None:
+            continue
+        paper["paper_id"] = f"arxiv:{arxiv_id}"
+        paper["extra"] = {
+            "retrieval_providers": ["local_title"],
+            "local_title_rank": rank,
+            "local_title_bm25": float(bm25_score),
+        }
+        papers.append(paper)
+        if len(papers) >= num:
             break
-    return res
+    return papers
+
+
+@lru_cache(maxsize=512)
+def _cached_search_papers_by_title_index(query, num, end_date):
+    return tuple(_search_papers_by_title_index_uncached(query, num, end_date))
+
+
+def search_papers_by_title_index(query, num=20, end_date=None):
+    return copy.deepcopy(list(_cached_search_papers_by_title_index(query, int(num), end_date)))
     
+@lru_cache(maxsize=2048)
 def search_arxiv_id_by_title(title):
     """
     Search arxiv id by title.
@@ -515,7 +711,7 @@ def search_arxiv_id_by_title(title):
         warnings.warn(f"An error occurred while search_arxiv_id_by_title: {e}")
         return None
 
-def search_paper_by_title(title):
+def _search_paper_by_title_uncached(title):
     """
     Search paper by title.
     :param title: title of the paper
@@ -526,6 +722,29 @@ def search_paper_by_title(title):
         return None
     title_id = title_id.split('v')[0]
     return search_paper_by_arxiv_id(title_id)
+
+
+@lru_cache(maxsize=2048)
+def _cached_search_paper_by_title(title):
+    return _search_paper_by_title_uncached(title)
+
+
+def search_paper_by_title(title):
+    return copy.deepcopy(_cached_search_paper_by_title(title))
+
+
+def retrieval_cache_stats():
+    """Expose cache effectiveness for benchmark and operations diagnostics."""
+    return {
+        "serper": _cached_google_search_arxiv_id.cache_info()._asdict(),
+        "openalex": _cached_openalex_search_papers.cache_info()._asdict(),
+        "sections": _cached_search_section_by_arxiv_id.cache_info()._asdict(),
+        "paper_by_id": _cached_search_paper_by_arxiv_id.cache_info()._asdict(),
+        "paper_batch": _cached_search_papers_by_arxiv_ids.cache_info()._asdict(),
+        "title_index": _cached_search_papers_by_title_index.cache_info()._asdict(),
+        "id_by_title": search_arxiv_id_by_title.cache_info()._asdict(),
+        "paper_by_title": _cached_search_paper_by_title.cache_info()._asdict(),
+    }
 
 def get_subsection(sections):
     res = {}

@@ -11,10 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
+import threading
+
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 class Agent:
-    def __init__(self, model_name, device_map="auto"):
+    def __init__(self, model_name, device_map="auto", score_batch_size=8):
+        self.score_batch_size = max(1, int(score_batch_size))
+        # Transformers generation mutates model-side caches. A model instance must
+        # not serve several search threads concurrently on the same GPU.
+        self._inference_lock = threading.Lock()
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype="auto",
@@ -29,24 +37,56 @@ class Agent:
     def infer_score(self, prompts):
         if len(prompts) == 0:
             return []
-        encoded_input = self.tokenizer(prompts, return_tensors='pt', padding=True, truncation=True)
+        with self._inference_lock, torch.inference_mode():
+            scores = []
+            for start in range(0, len(prompts), self.score_batch_size):
+                scores.extend(
+                    self._infer_score_with_oom_retry(
+                        prompts[start:start + self.score_batch_size]
+                    )
+                )
+            return scores
+
+    def _infer_score_with_oom_retry(self, prompts):
+        try:
+            return self._infer_score_batch(prompts)
+        except torch.OutOfMemoryError:
+            # Fragmented CUDA reservations can remain after a failed generation.
+            # Release them and retry smaller batches before failing the task.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if len(prompts) <= 1:
+                raise
+            midpoint = len(prompts) // 2
+            return (
+                self._infer_score_with_oom_retry(prompts[:midpoint])
+                + self._infer_score_with_oom_retry(prompts[midpoint:])
+            )
+
+    def _infer_score_batch(self, prompts):
+        encoded_input = self.tokenizer(
+            prompts,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=992,
+        )
         input_ids = encoded_input.input_ids.to(self.model.device)
         attention_mask = encoded_input.attention_mask.to(self.model.device)
-
         outputs = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=1,
-            output_scores=True, 
-            return_dict_in_generate=True, 
+            output_scores=True,
+            return_dict_in_generate=True,
             do_sample=False,
             temperature=None,
             top_p=None,
             top_k=None,
         )
         true_token_id = self.tokenizer.convert_tokens_to_ids('True')
-        probs = outputs.scores[0].softmax(dim=-1)[:, true_token_id].cpu().numpy().tolist()
-        return probs
+        return outputs.scores[0].softmax(dim=-1)[:, true_token_id].cpu().tolist()
 
     def infer(self, prompt, sample=False, max_new_tokens=512):
         text = self.tokenizer.apply_chat_template(
@@ -58,7 +98,9 @@ class Agent:
             max_length=992,
             add_generation_prompt=True
         )
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        model_inputs = self.tokenizer(
+            [text], return_tensors="pt", truncation=True, max_length=992
+        ).to(self.model.device)
         if sample:
             model_inputs["do_sample"] = True
             model_inputs["temperature"] = 2.0
@@ -69,10 +111,11 @@ class Agent:
             model_inputs["top_p"] = None
             model_inputs["top_k"] = None
 
-        generated_ids = self.model.generate(
-            **model_inputs,
-            max_new_tokens=max_new_tokens
-        )
+        with self._inference_lock, torch.inference_mode():
+            generated_ids = self.model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens
+            )
         generated_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
         ]
@@ -93,26 +136,33 @@ class Agent:
             add_generation_prompt=True
         ) for prompt in prompts]
         responses = []
-        for i in range(0, len(texts), batch_size):
-            model_inputs = self.tokenizer(texts[i: i + batch_size], return_tensors="pt", truncation=True, padding=True).to(self.model.device)
-            if sample:
-                model_inputs["do_sample"] = True
-                model_inputs["temperature"] = 2.0
-                model_inputs["top_p"] = 0.8
-            else:
-                model_inputs["do_sample"] = False
-                model_inputs["temperature"] = None
-                model_inputs["top_p"] = None
-                model_inputs["top_k"] = None
-            generated_ids = self.model.generate(
-                **model_inputs,
-                max_new_tokens=max_new_tokens
-            )
-            generated_ids = [
-                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-            ]
-            for response in self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True):
-                responses.append(response)
+        with self._inference_lock, torch.inference_mode():
+            for i in range(0, len(texts), batch_size):
+                model_inputs = self.tokenizer(
+                    texts[i: i + batch_size],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=992,
+                    padding=True,
+                ).to(self.model.device)
+                if sample:
+                    model_inputs["do_sample"] = True
+                    model_inputs["temperature"] = 2.0
+                    model_inputs["top_p"] = 0.8
+                else:
+                    model_inputs["do_sample"] = False
+                    model_inputs["temperature"] = None
+                    model_inputs["top_p"] = None
+                    model_inputs["top_k"] = None
+                generated_ids = self.model.generate(
+                    **model_inputs,
+                    max_new_tokens=max_new_tokens
+                )
+                generated_ids = [
+                    output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+                ]
+                for response in self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True):
+                    responses.append(response)
         return responses
     
 if __name__ == "__main__":

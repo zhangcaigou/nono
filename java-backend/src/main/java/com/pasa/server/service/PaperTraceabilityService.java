@@ -8,6 +8,15 @@ import java.util.List;
 public interface PaperTraceabilityService {
     TraceablePapers enrich(String query, LocalDate endDate, List<ApiModels.PaperItem> papers);
 
+    default TraceablePapers enrich(
+            String query,
+            LocalDate endDate,
+            List<ApiModels.PaperItem> papers,
+            List<ApiModels.QueryConstraint> constraints
+    ) {
+        return enrich(query, endDate, papers);
+    }
+
     default ApiModels.RecommendationTrace enrichFullText(
             String query,
             LocalDate endDate,

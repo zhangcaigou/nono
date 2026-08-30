@@ -726,8 +726,24 @@ function ConversationMessage({
                     {result.summary.traceable_selected_count > 0 && (
                       <span>可溯源 {result.summary.traceable_selected_count} 篇</span>
                     )}
-                    {(result.summary.relation_count + (result.analysis?.semantic_relations.length || 0)) > 0 && (
-                      <span>关系 {result.summary.relation_count + (result.analysis?.semantic_relations.length || 0)} 条</span>
+                    {allRelations.length > 0 && (
+                      <span>关系 {allRelations.length} 条</span>
+                    )}
+                  </div>
+                )}
+                {result.efficiency && (
+                  <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-xs text-emerald-600">
+                    <span>总耗时 {(result.efficiency.total_ms / 1000).toFixed(1)} 秒</span>
+                    <span>检索 {(result.efficiency.model_search_ms / 1000).toFixed(1)} 秒</span>
+                    {result.efficiency.deepseek_ms > 0 && (
+                      <span>推荐分析 {(result.efficiency.deepseek_ms / 1000).toFixed(1)} 秒</span>
+                    )}
+                    <span>外部/AI 调用 {result.efficiency.tracked_api_calls} 次</span>
+                    {result.deepseek_usage && result.deepseek_usage.total_calls > 0 && (
+                      <span>
+                        推荐批次 {result.deepseek_usage.total_calls} 次 · Tokens{' '}
+                        {(result.deepseek_usage.input_tokens + result.deepseek_usage.output_tokens).toLocaleString()}
+                      </span>
                     )}
                   </div>
                 )}
@@ -907,11 +923,24 @@ function dedupePaperRelations(relations: PaperRelation[]): PaperRelation[] {
 
 function SearchAnalysisPanel({ analysis, papers }: { analysis: SearchAnalysis; papers: PaperItem[] }) {
   const synthesis = analysis.synthesis
+  const overview = synthesis.overview.trim() === '已依据入选论文摘要归纳研究路线，并横向整理摘要明确陈述的方法、主要发现与贡献。'
+    ? ''
+    : synthesis.overview
+  const understanding = analysis.query_understanding
   const titleOf = (paperId: string) => papers.find((paper) => paper.paper_id === paperId)?.title || paperId
   const insightGroups = [
     { title: '研究共识', values: synthesis.consensus, style: 'bg-emerald-50 border-emerald-100' },
     { title: '分歧与不确定性', values: synthesis.disagreements, style: 'bg-amber-50 border-amber-100' },
     { title: '研究空白', values: synthesis.research_gaps, style: 'bg-rose-50 border-rose-100' },
+  ].filter((group) => group.values.length > 0)
+  const understandingGroups = [
+    { label: '研究领域', values: understanding.domains },
+    { label: '方法约束', values: understanding.methods },
+    { label: '实体/对象', values: understanding.entities },
+    { label: '数据集', values: understanding.datasets },
+    { label: '硬性条件', values: understanding.hard_constraints },
+    { label: '排除条件', values: understanding.exclusions },
+    { label: '对比维度', values: understanding.comparison_dimensions },
   ].filter((group) => group.values.length > 0)
 
   return (
@@ -926,8 +955,8 @@ function SearchAnalysisPanel({ analysis, papers }: { analysis: SearchAnalysis; p
         {synthesis.direct_answer && (
           <p className="mt-2 text-sm leading-7 text-gray-800 whitespace-pre-wrap">{synthesis.direct_answer}</p>
         )}
-        {synthesis.overview && (
-          <p className="mt-2 text-xs leading-6 text-gray-600 whitespace-pre-wrap">{synthesis.overview}</p>
+        {overview && (
+          <p className="mt-2 text-xs leading-6 text-gray-600 whitespace-pre-wrap">{overview}</p>
         )}
         {analysis.possible_pair_count > 0 && (
           <p className="mt-1 text-[10px] text-indigo-400">
@@ -937,6 +966,34 @@ function SearchAnalysisPanel({ analysis, papers }: { analysis: SearchAnalysis; p
       </div>
 
       <div className="p-5 space-y-5">
+        {(understandingGroups.length > 0 || understanding.sub_questions.length > 1) && (
+          <div>
+            <h4 className="text-xs font-semibold text-gray-700 mb-2">查询理解与分解</h4>
+            <div className="rounded-xl border border-indigo-100 bg-indigo-50/40 p-3 space-y-2">
+              {understandingGroups.map((group) => (
+                <div key={group.label} className="flex flex-wrap items-start gap-1.5">
+                  <span className="w-16 shrink-0 text-[11px] font-semibold text-gray-500">{group.label}</span>
+                  {group.values.map((value, index) => (
+                    <span key={`${value}-${index}`} className="rounded-full border border-indigo-100 bg-white px-2 py-0.5 text-[10px] text-indigo-700">
+                      {value}
+                    </span>
+                  ))}
+                </div>
+              ))}
+              {understanding.sub_questions.length > 1 && (
+                <div className="pt-1 border-t border-indigo-100">
+                  <p className="text-[11px] font-semibold text-gray-500 mb-1">检索子问题</p>
+                  <ol className="space-y-1 text-[11px] leading-5 text-gray-600">
+                    {understanding.sub_questions.map((question, index) => (
+                      <li key={`${question}-${index}`}>{index + 1}. {question}</li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {synthesis.themes.length > 0 && (
           <div>
             <h4 className="text-xs font-semibold text-gray-700 mb-2">主要研究路线</h4>
@@ -969,35 +1026,6 @@ function SearchAnalysisPanel({ analysis, papers }: { analysis: SearchAnalysis; p
           </div>
         )}
 
-        {analysis.paper_analyses.length > 0 && (
-          <div>
-            <h4 className="text-xs font-semibold text-gray-700 mb-2">论文横向对比</h4>
-            <div className="overflow-x-auto rounded-xl border border-gray-100">
-              <table className="min-w-[900px] w-full text-left text-[11px]">
-                <thead className="bg-gray-50 text-gray-500">
-                  <tr>
-                    <th className="p-2.5 w-52">论文</th>
-                    <th className="p-2.5">方法</th>
-                    <th className="p-2.5">主要发现</th>
-                    <th className="p-2.5">贡献</th>
-                    <th className="p-2.5">局限</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100 align-top text-gray-600">
-                  {analysis.paper_analyses.map((paper) => (
-                    <tr key={paper.paper_id}>
-                      <td className="p-2.5 font-medium text-gray-800">{titleOf(paper.paper_id)}</td>
-                      <td className="p-2.5">{paper.methodology.join('；') || '未确认'}</td>
-                      <td className="p-2.5">{paper.key_findings.join('；') || '未确认'}</td>
-                      <td className="p-2.5">{paper.contributions.join('；') || '未确认'}</td>
-                      <td className="p-2.5">{paper.limitations.join('；') || '未确认'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
       </div>
     </section>
   )

@@ -23,11 +23,18 @@ from utils      import (
     google_search_arxiv_id,
     openalex_search_papers,
     search_paper_by_arxiv_id,
+    search_papers_by_arxiv_ids,
+    search_papers_by_title_index,
     search_section_by_arxiv_id
 )
 
 class PaperAgent:
     _chinese_pattern = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+    _query_stop_words = {
+        "a", "an", "and", "are", "about", "for", "give", "in", "is", "list",
+        "me", "of", "on", "paper", "papers", "provide", "research", "show", "some",
+        "study", "studies", "that", "the", "to", "using", "which", "with",
+    }
 
     @classmethod
     def contains_chinese(cls, text):
@@ -40,12 +47,16 @@ class PaperAgent:
         selector:       Agent, # prompt(s) -> score(s)
         end_date:       str = datetime.now().strftime("%Y%m%d"),
         prompts_path:   str = "agent_prompt.json",
-        expand_layers:  int = 2,
+        expand_layers:  int = 0,
         search_queries: int = 5,
         search_papers:  int = 10, # per query
-        expand_papers:  int = 20, # per layer
+        expand_papers:  int = 10, # per layer
+        expand_refs_per_paper: int = 12, # citation candidates per expanded paper
+        local_search_papers: int = 20, # per query from bundled title index
+        selector_threshold: float = 0.5,
         threads_num:    int = 20, # number of threads in parallel at the same time
         progress_callback = None, # optional (papers_found, papers_selected) callback
+        query_planner = None,     # optional query -> {queries, metrics}
     ) -> None:
         self.crawler    = crawler
         self.selector   = selector
@@ -61,11 +72,24 @@ class PaperAgent:
                 "original_user_query": self.original_user_query,
                 "input_language": self.input_language,
                 "generated_search_queries": [],
+                "query_plan": {},
+                "selector_threshold": min(1.0, max(0.0, float(selector_threshold))),
+                "query_planning": {},
+                "adaptive_search": {
+                    "triggered": False,
+                    "reason": "initial_retrieval_sufficient",
+                    "queries": [],
+                },
                 "retrieval_stats": {
                     "serper_calls": 0,
                     "openalex_calls": 0,
                     "serper_candidates": 0,
                     "openalex_candidates": 0,
+                    "local_calls": 0,
+                    "local_candidates": 0,
+                    "expansion_layers": [],
+                    "citation_candidates": 0,
+                    "citation_candidates_bounded": 0,
                     "provider_errors": [],
                 },
                 "touch_ids": [],
@@ -79,8 +103,12 @@ class PaperAgent:
         self.search_queries  = search_queries
         self.search_papers   = search_papers
         self.expand_papers   = expand_papers
+        self.expand_refs_per_paper = expand_refs_per_paper
+        self.local_search_papers = local_search_papers
+        self.selector_threshold = min(1.0, max(0.0, float(selector_threshold)))
         self.threads_num     = threads_num
         self.progress_callback = progress_callback
+        self.query_planner = query_planner
         self.papers_queue    = []
         self.expand_start    = 0
         self.lock            = threading.Lock()
@@ -120,6 +148,99 @@ class PaperAgent:
             return paper["paper_id"]
         normalized_title = re.sub(r"\W+", "", paper.get("title", "")).lower()
         return f"title:{normalized_title}"
+
+    @classmethod
+    def _query_terms(cls, query):
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", query.lower())
+            if len(token) > 1 and token not in cls._query_stop_words
+        }
+
+    @classmethod
+    def _select_diverse_queries(cls, parsed, original_query, limit):
+        """Greedily maximize lexical coverage across an oversized query pool."""
+        original = original_query.strip()
+        candidates = list(dict.fromkeys(query.strip() for query in parsed if query.strip()))
+        if original and original not in candidates:
+            candidates.append(original)
+        if len(candidates) <= limit:
+            return candidates[:limit]
+
+        selected = [candidates.pop(0)]
+        selected_terms = [cls._query_terms(selected[0])]
+        reserve_original = original and original not in selected
+        if reserve_original:
+            candidates.remove(original)
+        diversity_limit = limit - int(bool(reserve_original))
+        while candidates and len(selected) < diversity_limit:
+            best_index = 0
+            best_similarity = float("inf")
+            for index, candidate in enumerate(candidates):
+                terms = cls._query_terms(candidate)
+                maximum_similarity = max(
+                    len(terms & existing) / len(terms | existing)
+                    if terms | existing else 1.0
+                    for existing in selected_terms
+                )
+                if maximum_similarity < best_similarity:
+                    best_index = index
+                    best_similarity = maximum_similarity
+            chosen = candidates.pop(best_index)
+            selected.append(chosen)
+            selected_terms.append(cls._query_terms(chosen))
+        if reserve_original and len(selected) < limit:
+            selected.append(original)
+        return selected
+
+    @staticmethod
+    def _bounded_expand_candidates(candidates, budget, threshold=0.5):
+        """Bound every expansion layer while prioritizing Selector-approved papers.
+
+        Keep a small top-score fallback when too few papers cross the 0.5 threshold so
+        an imperfect Selector does not completely suppress citation recall.
+        """
+        if budget <= 0:
+            return []
+        candidates = list(candidates)
+        approved = [paper for paper in candidates if paper.select_score > threshold]
+        minimum_coverage = min(len(candidates), max(3, budget // 2))
+        target = min(budget, max(minimum_coverage, len(approved)))
+        return candidates[:target]
+
+    @staticmethod
+    def _bounded_section_references(sections, selected_sections, budget):
+        """Round-robin references across Crawler-selected sections under a hard cap."""
+        queues = []
+        seen_sections = set()
+        total = 0
+        for raw_section in selected_sections:
+            section = raw_section.strip()
+            if section in seen_sections or section not in sections:
+                continue
+            seen_sections.add(section)
+            references = list(dict.fromkeys(sections[section]))
+            total += len(references)
+            queues.append([section, references])
+
+        bounded = []
+        seen_titles = set()
+        while queues and len(bounded) < budget:
+            next_queues = []
+            for section, references in queues:
+                while references:
+                    title = references.pop(0)
+                    key = re.sub(r"\W+", "", title).lower()
+                    if key and key not in seen_titles:
+                        seen_titles.add(key)
+                        bounded.append([section, title])
+                        break
+                if references:
+                    next_queues.append([section, references])
+                if len(bounded) >= budget:
+                    break
+            queues = next_queues
+        return bounded, total
 
     @staticmethod
     def _merge_candidate(existing, incoming):
@@ -163,13 +284,16 @@ class PaperAgent:
                 query = queries.pop()
                 self.root.child[query] = []
 
-            serper_ids, openalex_papers = [], []
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            serper_ids, openalex_papers, local_papers = [], [], []
+            with ThreadPoolExecutor(max_workers=3) as executor:
                 serper_future = executor.submit(
                     google_search_arxiv_id, query, self.search_papers, self.end_date
                 )
                 openalex_future = executor.submit(
                     openalex_search_papers, query, self.search_papers, self.end_date
+                )
+                local_future = executor.submit(
+                    search_papers_by_title_index, query, self.local_search_papers, self.end_date
                 )
                 try:
                     serper_ids = serper_future.result()
@@ -181,17 +305,19 @@ class PaperAgent:
                     self._record_retrieval("openalex", openalex_papers)
                 except Exception as exc:
                     self._record_retrieval("openalex", error=exc)
+                try:
+                    local_papers = local_future.result()
+                    self._record_retrieval("local", local_papers)
+                except Exception as exc:
+                    self._record_retrieval("local", error=exc)
 
-            searched_papers = []
-            for arxiv_id in serper_ids:
-                arxiv_id = arxiv_id.split('v')[0]
-                paper = search_paper_by_arxiv_id(arxiv_id)
-                if paper is not None:
-                    paper["paper_id"] = f"arxiv:{arxiv_id}"
-                    paper["extra"] = {"retrieval_providers": ["serper"]}
-                    searched_papers.append(paper)
+            searched_papers = search_papers_by_arxiv_ids(serper_ids)
+            for paper in searched_papers:
+                paper["paper_id"] = f"arxiv:{paper['arxiv_id']}"
+                paper["extra"] = {"retrieval_providers": ["serper"]}
 
             searched_papers.extend(openalex_papers)
+            searched_papers.extend(local_papers)
             merged_papers = {}
             for paper in searched_papers:
                 key = self._candidate_key(paper)
@@ -213,7 +339,7 @@ class PaperAgent:
             with self.lock:
                 for score, paper in zip(scores, searched_papers):
                     self.root.extra["crawler_recall_papers"].append(paper["title"])
-                    if score > 0.5:
+                    if score > self.selector_threshold:
                         self.root.extra["recall_papers"].append(paper["title"])
                     paper_node = PaperNode({
                         "title":        paper["title"],
@@ -236,24 +362,59 @@ class PaperAgent:
                     ]
                     self.progress_callback(
                         len(papers),
-                        sum(paper.select_score > 0.5 for paper in papers),
+                        sum(paper.select_score > self.selector_threshold for paper in papers),
                     )
 
     def search(self):
-        prompt = self.prompts["generate_query"].format(user_query=self.user_query).strip()
-        response = self.crawler.infer(prompt)
-        parsed = [
-            query.strip()
-            for query in re.findall(self.templates["search_template"], response, flags=re.DOTALL)
-            if query.strip()
-        ]
-        queries = list(dict.fromkeys(parsed))[:self.search_queries]
-        if not queries:
+        parsed = []
+        if self.query_planner is not None:
+            planned = self.query_planner(self.original_user_query, self.search_queries)
+            if isinstance(planned, dict):
+                parsed = list(planned.get("queries") or [])
+                self.root.extra["query_plan"] = dict(planned.get("query_plan") or {})
+                self.root.extra["query_planning"] = dict(planned.get("metrics") or {})
+        if not parsed:
+            prompt = self.prompts["generate_query"].format(user_query=self.user_query).strip()
+            response = self.crawler.infer(prompt)
+            parsed = [
+                query.strip()
+                for query in re.findall(self.templates["search_template"], response, flags=re.DOTALL)
+                if query.strip()
+            ]
+        initial_queries = self._select_diverse_queries(
+            parsed, self.original_user_query, self.search_queries
+        )
+        if not initial_queries:
             raise RuntimeError("Crawler did not generate any valid search query")
-        self.root.extra["generated_search_queries"] = list(queries)
+        self.root.extra["generated_search_queries"] = list(initial_queries)
         if self.progress_callback is not None:
             self.progress_callback(0, 0)
-        PaperAgent.do_parallel(self.search_paper, (queries,), len(queries))
+        PaperAgent.do_parallel(
+            self.search_paper, (list(initial_queries),), len(initial_queries)
+        )
+
+        children = getattr(self.root, "child", None)
+        if isinstance(children, dict) and children:
+            selector_threshold = getattr(self, "selector_threshold", 0.5)
+            selected_count = sum(
+                paper.select_score > selector_threshold
+                for papers in children.values()
+                for paper in papers
+            )
+            reserve_queries = list(dict.fromkeys(
+                query.strip() for query in parsed
+                if query.strip() and query.strip() not in initial_queries
+            ))
+            if selected_count < 3 and reserve_queries:
+                adaptive_query = reserve_queries[0]
+                self.root.extra["adaptive_search"] = {
+                    "triggered": True,
+                    "reason": "fewer_than_3_selector_approved_papers",
+                    "initial_selected_count": selected_count,
+                    "queries": [adaptive_query],
+                }
+                self.root.extra["generated_search_queries"].append(adaptive_query)
+                PaperAgent.do_parallel(self.search_paper, ([adaptive_query],), 1)
 
     def get_paper_content(self, new_expand, crawl_prompts, have_full_paper):
         while True:
@@ -310,19 +471,19 @@ class PaperAgent:
                 paper = have_full_paper.pop(0)
                 crawl_result = crawl_results.pop(0)
             crawl_result = re.findall(self.templates["expand_template"], crawl_result, flags=re.DOTALL)
-            section_sources_ori = []
-            for section in crawl_result:
-                section = section.strip()
-                if section not in paper.sections:
-                    continue
-                for ref in paper.sections[section]:
-                    section_sources_ori.append([section, ref])
+            section_sources_ori, original_candidate_count = self._bounded_section_references(
+                paper.sections, crawl_result, self.expand_refs_per_paper
+            )
+            with self.lock:
+                stats = self.root.extra["retrieval_stats"]
+                stats["citation_candidates"] += original_candidate_count
+                stats["citation_candidates_bounded"] += len(section_sources_ori)
             select_prompts, section_sources, lock = [], [], threading.Lock()
             PaperAgent.do_parallel(self.search_ref, (section_sources_ori, select_prompts, section_sources, lock), self.threads_num * 3)
             scores = self.selector.infer_score(select_prompts)
             for score, (section, ref_paper) in zip(scores, section_sources):
                 self.root.extra["crawler_recall_papers"].append(ref_paper["title"])
-                if score > 0.5:
+                if score > self.selector_threshold:
                     self.root.extra["recall_papers"].append(ref_paper["title"])
                 paper_node = PaperNode({
                     "title":        ref_paper["title"],
@@ -343,10 +504,20 @@ class PaperAgent:
                     self.papers_queue.append(paper_node)
 
     def expand(self, depth):
-        expand_papers = sorted(self.papers_queue[self.expand_start:], key=PaperNode.sort_paper, reverse=True)
-        self.papers_queue = self.papers_queue[:self.expand_start] + expand_papers
-        if depth > 0:
-            expand_papers = expand_papers[:self.expand_papers]
+        candidates = sorted(self.papers_queue[self.expand_start:], key=PaperNode.sort_paper, reverse=True)
+        self.papers_queue = self.papers_queue[:self.expand_start] + candidates
+        expand_papers = self._bounded_expand_candidates(
+            candidates, self.expand_papers, self.selector_threshold
+        )
+        with self.lock:
+            self.root.extra["retrieval_stats"]["expansion_layers"].append({
+                "depth": depth,
+                "candidates": len(candidates),
+                "expanded": len(expand_papers),
+                "approved_candidates": sum(
+                    paper.select_score > self.selector_threshold for paper in candidates
+                ),
+            })
         self.expand_start = len(self.papers_queue)
         crawl_prompts, have_full_paper = [], []
         PaperAgent.do_parallel(self.get_paper_content, (expand_papers, crawl_prompts, have_full_paper), self.threads_num)

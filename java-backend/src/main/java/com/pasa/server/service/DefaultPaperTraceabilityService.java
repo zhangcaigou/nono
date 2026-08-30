@@ -84,6 +84,16 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
 
     @Override
     public TraceablePapers enrich(String query, LocalDate endDate, List<ApiModels.PaperItem> papers) {
+        return enrich(query, endDate, papers, constraintParser.parse(query, endDate));
+    }
+
+    @Override
+    public TraceablePapers enrich(
+            String query,
+            LocalDate endDate,
+            List<ApiModels.PaperItem> papers,
+            List<ApiModels.QueryConstraint> plannedConstraints
+    ) {
         if (!properties.isTraceabilityEnabled()) {
             return new TraceablePapers(papers.stream().map(DefaultPaperTraceabilityService::normalizeWithoutTrace).toList(),
                     List.of(), List.of(), false);
@@ -94,7 +104,9 @@ public class DefaultPaperTraceabilityService implements PaperTraceabilityService
             return hit.result();
         }
 
-        List<ApiModels.QueryConstraint> constraints = constraintParser.parse(query, endDate);
+        List<ApiModels.QueryConstraint> constraints = plannedConstraints == null || plannedConstraints.isEmpty()
+                ? constraintParser.parse(query, endDate)
+                : List.copyOf(plannedConstraints);
         List<ApiModels.PaperItem> selectedTopN = papers.stream()
                 .filter(ApiModels.PaperItem::selected)
                 .limit(properties.getTraceTopN())

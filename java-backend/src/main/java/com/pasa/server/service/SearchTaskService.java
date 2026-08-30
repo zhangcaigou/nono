@@ -1,5 +1,6 @@
 package com.pasa.server.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.pasa.server.api.ApiModels;
 import com.pasa.server.error.ApiException;
 import com.pasa.server.model.ModelGateway;
@@ -46,7 +47,7 @@ public class SearchTaskService {
     public ApiModels.TaskAccepted create(ApiModels.CreateSearchTaskRequest request) {
         String taskId = UUID.randomUUID().toString().replace("-", "");
         ApiModels.SearchOptions options = request.options() == null
-                ? new ApiModels.SearchOptions(null, null, null, null).normalized()
+                ? new ApiModels.SearchOptions(null, null, null, null, null).normalized()
                 : request.options().normalized();
         ApiModels.CreateSearchTaskRequest normalized = new ApiModels.CreateSearchTaskRequest(
                 request.query().strip(), request.endDate(), options);
@@ -62,6 +63,7 @@ public class SearchTaskService {
     }
 
     private void execute(String taskId) {
+        long totalStarted = System.nanoTime();
         TaskState task = require(taskId);
         synchronized (task) {
             if (task.cancelRequested) {
@@ -74,12 +76,14 @@ public class SearchTaskService {
         }
 
         try {
+            long modelStarted = System.nanoTime();
             ModelModels.ModelSearchResponse response = modelGateway.search(new ModelModels.ModelSearchRequest(
                     task.taskId,
                     task.request.query(),
                     task.request.endDate(),
                     task.request.options()
             ), progress -> updateModelProgress(taskId, progress));
+            long modelSearchMs = elapsedMs(modelStarted);
             List<ApiModels.PaperItem> papers = response.papers().stream()
                     .map(SearchTaskService::withPublicationYearFallback)
                     .toList();
@@ -87,28 +91,43 @@ public class SearchTaskService {
                 task.stage = TaskState.Stage.ENRICHING;
                 task.progress = completedProgress(task, response);
             }
+            List<ApiModels.QueryConstraint> plannedConstraints = new QueryConstraintParser()
+                    .parseAnalysis(response.analysis(), task.request.query(), task.request.endDate());
             PaperTraceabilityService.TraceablePapers traceable;
+            long traceabilityStarted = System.nanoTime();
             try {
                 traceable = traceabilityService.enrich(
-                        task.request.query(), task.request.endDate(), papers);
+                        task.request.query(), task.request.endDate(), papers, plannedConstraints);
             } catch (Exception exception) {
                 log.warn("Paper traceability enrichment failed for task {}; returning result without traces", taskId,
                         exception);
                 traceable = PaperTraceabilityService.degraded(papers);
             }
+            long traceabilityMs = elapsedMs(traceabilityStarted);
             List<ApiModels.QueryConstraint> constraints = traceable.constraints().isEmpty()
-                    && deepSeekEvidenceGenerator.isEnabled()
-                    ? new QueryConstraintParser().parse(task.request.query(), task.request.endDate())
+                    ? plannedConstraints
                     : traceable.constraints();
             DeepSeekEvidenceGenerator.BatchResult deepSeek;
-            try {
-                deepSeek = deepSeekEvidenceGenerator.enrich(
-                        task.request.query(), constraints, traceable.papers());
-            } catch (Exception exception) {
-                log.warn("DeepSeek evidence enrichment failed for task {}; preserving Selector results", taskId,
-                        exception);
-                deepSeek = deepSeekEvidenceGenerator.degraded(traceable.papers());
+            long deepSeekStarted = System.nanoTime();
+            if (Boolean.TRUE.equals(task.request.options().recommendationAnalysis())) {
+                try {
+                    deepSeek = deepSeekEvidenceGenerator.enrich(
+                            task.request.query(), constraints, traceable.papers());
+                } catch (Exception exception) {
+                    log.warn("DeepSeek evidence enrichment failed for task {}; preserving Selector results", taskId,
+                            exception);
+                    deepSeek = deepSeekEvidenceGenerator.degraded(traceable.papers());
+                }
+            } else {
+                deepSeek = deepSeekEvidenceGenerator.disabled(traceable.papers());
             }
+            long deepSeekMs = elapsedMs(deepSeekStarted);
+            ApiModels.EfficiencyMetrics efficiency = new ApiModels.EfficiencyMetrics(
+                    elapsedMs(totalStarted), modelSearchMs, traceabilityMs, deepSeekMs,
+                    trackedModelApiCalls(response.metrics()) + deepSeek.usage().totalCalls(),
+                    trackedModelTokens(response.metrics(), "input_tokens") + deepSeek.usage().inputTokens(),
+                    trackedModelTokens(response.metrics(), "output_tokens") + deepSeek.usage().outputTokens(),
+                    response.metrics());
             synchronized (task) {
                 if (task.cancelRequested) {
                     markCancelled(task);
@@ -124,13 +143,17 @@ public class SearchTaskService {
                         response.tree(),
                         resultSummary(traceable),
                         response.analysis(),
-                        deepSeek.usage()
+                        deepSeek.usage(),
+                        efficiency
                 );
                 task.progress = completedProgress(task, response);
                 task.status = TaskState.Status.SUCCEEDED;
                 task.stage = TaskState.Stage.FINISHED;
                 task.finishedAt = Instant.now();
             }
+            log.info("Search task {} completed total_ms={} model_ms={} trace_ms={} deepseek_ms={} api_calls={}",
+                    taskId, efficiency.totalMs(), efficiency.modelSearchMs(), efficiency.traceabilityMs(),
+                    efficiency.deepSeekMs(), efficiency.trackedApiCalls());
         } catch (ModelServiceException exception) {
             log.error("Python model service rejected task {} with code {}", taskId, exception.getCode(), exception);
             synchronized (task) {
@@ -162,6 +185,24 @@ public class SearchTaskService {
                 task.finishedAt = Instant.now();
             }
         }
+    }
+
+    private static long elapsedMs(long started) {
+        return Math.max(0, (System.nanoTime() - started) / 1_000_000);
+    }
+
+    private static long trackedModelApiCalls(JsonNode metrics) {
+        if (metrics == null) return 0;
+        if (metrics.has("provider_network_calls")) {
+            return metrics.path("provider_network_calls").asLong(0);
+        }
+        JsonNode retrieval = metrics.path("retrieval_stats");
+        return retrieval.path("serper_calls").asLong(0) + retrieval.path("openalex_calls").asLong(0);
+    }
+
+    private static long trackedModelTokens(JsonNode metrics, String field) {
+        if (metrics == null) return 0;
+        return metrics.path("query_planning").path(field).asLong(0);
     }
 
     public ApiModels.TaskView get(String taskId) {

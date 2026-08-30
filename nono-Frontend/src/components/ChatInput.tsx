@@ -15,11 +15,12 @@ export default function ChatInput({ onSubmit, isSubmitting, disabled, placeholde
   const [endDate, setEndDate] = useState('')
   const [validationError, setValidationError] = useState('')
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [recommendationAnalysis, setRecommendationAnalysis] = useState(true)
   const [options, setOptions] = useState({
-    expand_layers: 2,
+    expand_layers: 0,
     search_queries: 5,
     search_papers: 10,
-    expand_papers: 20,
+    expand_papers: 10,
   })
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -40,7 +41,10 @@ export default function ChatInput({ onSubmit, isSubmitting, disabled, placeholde
       return
     }
     setValidationError('')
-    onSubmit(trimmed, { end_date: endDate, options: { ...options } })
+    onSubmit(trimmed, {
+      end_date: endDate,
+      options: { ...options, recommendation_analysis: recommendationAnalysis },
+    })
     setQuery('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
   }
@@ -73,7 +77,7 @@ export default function ChatInput({ onSubmit, isSubmitting, disabled, placeholde
     <div className="w-full">
       {/* Advanced options (collapsible) */}
       {showAdvanced && (
-        <div className={`overflow-hidden transition-all duration-300 ${advancedOpen ? 'max-h-64 opacity-100 mb-3' : 'max-h-0 opacity-0'}`}>
+        <div className={`overflow-hidden transition-all duration-300 ${advancedOpen ? 'max-h-80 opacity-100 mb-3' : 'max-h-0 opacity-0'}`}>
           <div className="bg-gray-50 rounded-xl p-4 space-y-2.5 border border-gray-100">
             {rangeSlider('扩展层数', 'expand_layers', 0, 4)}
             {rangeSlider('检索词数量', 'search_queries', 1, 10)}
@@ -88,6 +92,18 @@ export default function ChatInput({ onSubmit, isSubmitting, disabled, placeholde
                 className="flex-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400"
               />
             </div>
+            <label className="flex items-center gap-3 pt-1 cursor-pointer">
+              <span className="text-xs text-gray-500 w-28 shrink-0">AI 推荐分析</span>
+              <input
+                type="checkbox"
+                checked={recommendationAnalysis}
+                onChange={(event) => setRecommendationAnalysis(event.target.checked)}
+                className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-300"
+              />
+              <span className="text-[11px] text-gray-400">
+                默认开启；多篇论文合并为 1 次批量推荐请求，可手动关闭以节省费用
+              </span>
+            </label>
           </div>
         </div>
       )}

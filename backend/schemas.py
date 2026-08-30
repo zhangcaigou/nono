@@ -21,10 +21,10 @@ class TaskStage(str, Enum):
 class SearchOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    expand_layers: int = Field(default=2, ge=0, le=4)
+    expand_layers: int = Field(default=0, ge=0, le=4)
     search_queries: int = Field(default=5, ge=1, le=10)
     search_papers: int = Field(default=10, ge=1, le=30)
-    expand_papers: int = Field(default=20, ge=1, le=50)
+    expand_papers: int = Field(default=10, ge=1, le=50)
 
 
 class ModelSearchRequest(BaseModel):
@@ -152,6 +152,7 @@ class ModelSearchResponse(BaseModel):
     tree: dict[str, Any]
     summary: ResultSummary
     analysis: SearchAnalysis | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import sqlite3
+import tempfile
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import paper_agent
@@ -10,6 +13,47 @@ from paper_agent import PaperAgent
 
 
 class OpenAlexNormalizationTest(unittest.TestCase):
+    def test_local_title_index_returns_ranked_bundled_papers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory) / "titles.sqlite3"
+            connection = sqlite3.connect(index)
+            connection.execute(
+                "CREATE VIRTUAL TABLE paper_titles USING fts5(arxiv_id UNINDEXED, title)"
+            )
+            connection.executemany(
+                "INSERT INTO paper_titles(arxiv_id, title) VALUES (?, ?)",
+                [
+                    ("2401.00001", "Data Pruning for Language Model Pretraining"),
+                    ("2401.00002", "Unrelated Vision Paper"),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            def local(arxiv_id):
+                return {
+                    "arxiv_id": arxiv_id,
+                    "title": "Data Pruning for Language Model Pretraining",
+                    "abstract": "Abstract",
+                    "sections": "",
+                    "source": "SearchFrom:local_paper_db",
+                }
+
+            with patch.object(utils, "title_index_path", index), patch.object(
+                utils, "_local_paper_by_arxiv_id", side_effect=local
+            ):
+                papers = utils._search_papers_by_title_index_uncached(
+                    "data pruning language model", 5, "20240924"
+                )
+
+        self.assertEqual(["2401.00001"], [paper["arxiv_id"] for paper in papers])
+        self.assertEqual(["local_title"], papers[0]["extra"]["retrieval_providers"])
+
+    def test_local_title_index_respects_end_date_by_arxiv_month(self) -> None:
+        self.assertTrue(utils._arxiv_not_after("2409.99999", "20240924"))
+        self.assertFalse(utils._arxiv_not_after("2410.00001", "20240924"))
+        self.assertTrue(utils._arxiv_not_after("not-arxiv", "20240924"))
+
     def test_normalizes_work_and_reconstructs_abstract(self) -> None:
         response = Mock(status_code=200)
         response.json.return_value = {
@@ -44,6 +88,23 @@ class OpenAlexNormalizationTest(unittest.TestCase):
 
 
 class ParallelRetrievalTest(unittest.TestCase):
+    def test_batches_missing_serper_arxiv_ids_through_openalex_doi(self) -> None:
+        response = Mock(status_code=200)
+        response.json.return_value = {"results": [{
+            "id": "https://openalex.org/W1",
+            "title": "Paper One",
+            "ids": {"arxiv": "https://arxiv.org/abs/2402.00001"},
+            "primary_location": {},
+        }]}
+        with patch.object(utils, "_local_paper_by_arxiv_id", return_value=None), patch.object(
+            utils.requests, "get", return_value=response
+        ) as get:
+            papers = utils._search_papers_by_arxiv_ids_uncached(("2402.00001", "2402.00002"))
+
+        self.assertEqual(["2402.00001"], [paper["arxiv_id"] for paper in papers])
+        get.assert_called_once()
+        self.assertIn("10.48550/arxiv.2402.00001", get.call_args.kwargs["params"]["filter"])
+
     def test_merges_serper_and_openalex_and_keeps_openalex_only_work(self) -> None:
         class Crawler:
             def infer(self, _prompt):
@@ -82,7 +143,9 @@ class ParallelRetrievalTest(unittest.TestCase):
         ]
         with patch.object(paper_agent, "google_search_arxiv_id", return_value=["2402.00001"]), patch.object(
             paper_agent, "openalex_search_papers", return_value=openalex_papers
-        ), patch.object(paper_agent, "search_paper_by_arxiv_id", return_value=serper_paper):
+        ), patch.object(
+            paper_agent, "search_papers_by_arxiv_ids", return_value=[serper_paper]
+        ), patch.object(paper_agent, "search_papers_by_title_index", return_value=[]):
             agent = PaperAgent(
                 "find papers", Crawler(), Selector(), expand_layers=0, search_queries=1
             )

@@ -20,14 +20,16 @@ public final class ApiModels {
             @JsonProperty("expand_layers") @Min(0) @Max(4) Integer expandLayers,
             @JsonProperty("search_queries") @Min(1) @Max(10) Integer searchQueries,
             @JsonProperty("search_papers") @Min(1) @Max(30) Integer searchPapers,
-            @JsonProperty("expand_papers") @Min(1) @Max(50) Integer expandPapers
+            @JsonProperty("expand_papers") @Min(1) @Max(50) Integer expandPapers,
+            @JsonProperty("recommendation_analysis") Boolean recommendationAnalysis
     ) {
         public SearchOptions normalized() {
             return new SearchOptions(
-                    expandLayers == null ? 2 : expandLayers,
+                    expandLayers == null ? 0 : expandLayers,
                     searchQueries == null ? 5 : searchQueries,
                     searchPapers == null ? 10 : searchPapers,
-                    expandPapers == null ? 20 : expandPapers
+                    expandPapers == null ? 10 : expandPapers,
+                    recommendationAnalysis == null || recommendationAnalysis
             );
         }
     }
@@ -262,6 +264,18 @@ public final class ApiModels {
             this(paperCount, selectedCount, 0, 0, 0, 0);
         }
     }
+
+    public record EfficiencyMetrics(
+            @JsonProperty("total_ms") long totalMs,
+            @JsonProperty("model_search_ms") long modelSearchMs,
+            @JsonProperty("traceability_ms") long traceabilityMs,
+            @JsonProperty("deepseek_ms") long deepSeekMs,
+            @JsonProperty("tracked_api_calls") long trackedApiCalls,
+            @JsonProperty("input_tokens") long inputTokens,
+            @JsonProperty("output_tokens") long outputTokens,
+            @JsonProperty("model_metrics") JsonNode modelMetrics
+    ) {}
+
     public record TaskResult(
             @JsonProperty("task_id") @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String taskId,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String query,
@@ -275,11 +289,13 @@ public final class ApiModels {
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"object", "null"}) JsonNode analysis,
             @JsonProperty("deepseek_usage")
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"object", "null"})
-            DeepSeekUsageStats deepseekUsage
+            DeepSeekUsageStats deepseekUsage,
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, types = {"object", "null"})
+            EfficiencyMetrics efficiency
     ) {
         public TaskResult(String taskId, String query, List<PaperItem> papers, JsonNode tree,
                           ResultSummary summary) {
-            this(taskId, query, List.of(), false, papers, List.of(), tree, summary, null, null);
+            this(taskId, query, List.of(), false, papers, List.of(), tree, summary, null, null, null);
         }
     }
 

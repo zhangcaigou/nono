@@ -24,6 +24,7 @@ export interface SearchOptions {
   search_queries?: number
   search_papers?: number
   expand_papers?: number
+  recommendation_analysis?: boolean
 }
 
 export interface SearchFormOptions {
@@ -308,6 +309,16 @@ export interface SearchResult {
     cache_hits: number
     degraded_papers: number
     model_name: string
+  } | null
+  efficiency: {
+    total_ms: number
+    model_search_ms: number
+    traceability_ms: number
+    deepseek_ms: number
+    tracked_api_calls: number
+    input_tokens: number
+    output_tokens: number
+    model_metrics: Record<string, unknown> | null
   } | null
 }
 

@@ -16,7 +16,7 @@ class DeepSeekEvidenceGeneratorTest {
     @Test
     void parsesAndValidatesLegalJsonForFullySatisfiedPaper() {
         DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(traceJson(
-                "high", "Directly matches the query.",
+                "high", "该论文采用知识蒸馏处理目标任务，并在真实数据上验证方法，直接对应查询关注的技术路线。",
                 result("C1", "satisfied", "E1"),
                 evidence("E1", "abstract", "uses knowledge distillation", "C1"))));
 
@@ -25,7 +25,9 @@ class DeepSeekEvidenceGeneratorTest {
 
         assertThat(batch.papers().getFirst().traceStatus()).isEqualTo("success");
         assertThat(batch.papers().getFirst().deepseekTrace().recommendationReason())
-                .isEqualTo("Directly matches the query.");
+                .contains("知识蒸馏", "真实数据");
+        assertThat(batch.papers().getFirst().deepseekTrace().constraintResults().getFirst().explanation())
+                .isEqualTo("该条件判断由下方可核验的论文原文证据支持。");
         assertThat(batch.papers().getFirst().deepseekTrace().satisfiedConstraints()).containsExactly("C1");
         assertThat(batch.usage().totalCalls()).isEqualTo(1);
     }
@@ -35,7 +37,7 @@ class DeepSeekEvidenceGeneratorTest {
         AtomicInteger calls = new AtomicInteger();
         DeepSeekEvidenceGenerator generator = generator((system, user) -> calls.incrementAndGet() == 1
                 ? completion("not-json")
-                : completion(traceJson("partial", "Evidence found.",
+                : completion(traceJson("partial", "该论文围绕查询任务给出具体技术方案，标题为相关性判断提供了直接依据。",
                     result("C1", "satisfied", "E1"),
                     evidence("E1", "title", "Paper", "C1"))));
 
@@ -62,7 +64,7 @@ class DeepSeekEvidenceGeneratorTest {
 
     @Test
     void distinguishesUnknownFromExplicitViolation() {
-        String json = traceJson("partial", "One exclusion is explicit; code is unknown.",
+        String json = traceJson("partial", "该论文明确评估了合成数据设置，可用于判断查询中的数据排除条件。",
                 result("C1", "violated", "E1") + "," + result("C2", "unknown", null),
                 evidence("E1", "abstract", "includes synthetic data", "C1"));
         DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(json));
@@ -78,7 +80,7 @@ class DeepSeekEvidenceGeneratorTest {
 
     @Test
     void keepsCodeAndDatasetUnknownWhenTopicIsRelevantButTheyAreNotStated() {
-        String json = traceJson("partial", "The topic matches, while code and dataset are not stated.",
+        String json = traceJson("partial", "该论文研究无人机定位方法，标题直接对应用户关注的定位任务。",
                 result("C1", "satisfied", "E1") + "," + result("C2", "unknown", null)
                         + "," + result("C3", "unknown", null),
                 evidence("E1", "title", "UAV Localization", "C1"));
@@ -118,7 +120,7 @@ class DeepSeekEvidenceGeneratorTest {
     @Test
     void removesHallucinatedExactTextAndChangesJudgmentToUnknown() {
         DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(traceJson(
-                "high", "Claims open source code.", result("C1", "satisfied", "E1"),
+                "high", "该论文讨论定位方法，并声称提供开源代码以回应用户对实现可用性的关注。", result("C1", "satisfied", "E1"),
                 evidence("E1", "abstract", "Code is available on GitHub", "C1"))));
 
         var trace = generator.enrich("open source code", constraints("soft"),
@@ -133,7 +135,7 @@ class DeepSeekEvidenceGeneratorTest {
     @Test
     void changesNonUnknownWithoutEvidenceToUnknown() {
         DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(traceJson(
-                "partial", "No cited evidence.", result("C1", "partially_satisfied", null), "")));
+                "partial", "该论文围绕查询问题展开方法研究，可作为相关技术路线的候选工作。", result("C1", "partially_satisfied", null), "")));
 
         var result = generator.enrich("query", constraints("hard"),
                 List.of(paper("no-evidence", "Paper", "Abstract")))
@@ -145,10 +147,14 @@ class DeepSeekEvidenceGeneratorTest {
 
     @Test
     void onePaperFailureDoesNotAffectOtherPaper() {
+        AtomicInteger calls = new AtomicInteger();
         DeepSeekEvidenceGenerator generator = generator((system, user) -> {
-            if (user.contains("Slow Paper")) throw new IllegalStateException("timeout");
-            return completion(traceJson("high", "Matched.", result("C1", "satisfied", "E1"),
-                    evidence("E1", "title", "Good Paper", "C1")));
+            calls.incrementAndGet();
+            return completion(batchJson(
+                    batchItem("slow", "{}"),
+                    batchItem("good", traceJson("high", "该论文从标题所示任务出发提出具体方法，与查询关注的研究问题直接对应。",
+                            result("C1", "satisfied", "E1"),
+                            evidence("E1", "title", "Good Paper", "C1")))));
         });
 
         var papers = generator.enrich("query", constraints("hard"), List.of(
@@ -157,6 +163,51 @@ class DeepSeekEvidenceGeneratorTest {
 
         assertThat(papers).extracting(ApiModels.PaperItem::traceStatus)
                 .containsExactly("degraded", "success");
+        assertThat(calls).hasValue(1);
+    }
+
+    @Test
+    void batchesMultipleUncachedPapersIntoOneApiCall() {
+        AtomicInteger calls = new AtomicInteger();
+        DeepSeekEvidenceGenerator generator = generator((system, user) -> {
+            calls.incrementAndGet();
+            return completion(batchJson(
+                    batchItem("p1", traceJson("high", "第一篇论文针对编码器设计展开研究，其标题明确对应查询关注的第一类方法。",
+                            result("C1", "satisfied", "E1"),
+                            evidence("E1", "title", "First Paper", "C1"))),
+                    batchItem("p2", traceJson("partial", "第二篇论文重点研究排序策略，其标题体现了不同于第一篇的具体技术方向。",
+                            result("C1", "satisfied", "E2"),
+                            evidence("E2", "title", "Second Paper", "C1")))));
+        });
+
+        var batch = generator.enrich("query", constraints("hard"), List.of(
+                paper("p1", "First Paper", "Abstract"),
+                paper("p2", "Second Paper", "Abstract")));
+
+        assertThat(calls).hasValue(1);
+        assertThat(batch.usage().totalCalls()).isEqualTo(1);
+        assertThat(batch.usage().inputTokens()).isEqualTo(100);
+        assertThat(batch.usage().outputTokens()).isEqualTo(50);
+        assertThat(batch.papers()).extracting(ApiModels.PaperItem::traceStatus)
+                .containsExactly("success", "success");
+        assertThat(batch.papers()).extracting(
+                paper -> paper.deepseekTrace().recommendationReason())
+                .doesNotHaveDuplicates();
+    }
+
+    @Test
+    void rejectsGenericNonChineseRecommendationInsteadOfShowingTemplateAsSuccess() {
+        DeepSeekEvidenceGenerator generator = generator((system, user) -> completion(traceJson(
+                "high", "This paper is relevant and worth reading.",
+                result("C1", "satisfied", "E1"),
+                evidence("E1", "title", "Paper", "C1"))));
+
+        ApiModels.PaperItem result = generator.enrich(
+                "query", constraints("hard"), List.of(paper("generic", "Paper", "Abstract")))
+                .papers().getFirst();
+
+        assertThat(result.traceStatus()).isEqualTo("degraded");
+        assertThat(result.deepseekTrace()).isNull();
     }
 
     @Test
@@ -183,7 +234,7 @@ class DeepSeekEvidenceGeneratorTest {
         AtomicInteger calls = new AtomicInteger();
         DeepSeekEvidenceGenerator generator = generator((system, user) -> {
             calls.incrementAndGet();
-            return completion(traceJson("high", "Matched.", result("C1", "satisfied", "E1"),
+            return completion(traceJson("high", "该论文围绕目标任务提出明确方法，标题内容能够支持其与查询条件的具体关联。", result("C1", "satisfied", "E1"),
                     evidence("E1", "title", "Paper", "C1")));
         });
         ApiModels.PaperItem paper = paper("cached", "Paper", "Abstract");
@@ -247,5 +298,13 @@ class DeepSeekEvidenceGeneratorTest {
                 + "\",\"constraint_results\":[" + results + "],\"evidence\":[" + evidence + "],"
                 + "\"satisfied_constraints\":[],\"partially_satisfied_constraints\":[],"
                 + "\"violated_constraints\":[],\"unknown_constraints\":[]}";
+    }
+
+    private static String batchItem(String paperId, String trace) {
+        return "{\"paper_id\":\"" + paperId + "\",\"trace\":" + trace + "}";
+    }
+
+    private static String batchJson(String... items) {
+        return "{\"analyses\":[" + String.join(",", items) + "]}";
     }
 }

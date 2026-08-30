@@ -4,7 +4,10 @@ import path from 'path'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const backendUrl = env.VITE_API_BASE_URL || 'http://10.71.199.207:8080'
+  // The browser calls Vite through the same origin; Vite reaches the colocated
+  // Java service over loopback, so changing the server's LAN address cannot
+  // break development deployments.
+  const backendUrl = env.VITE_PROXY_TARGET || 'http://127.0.0.1:8080'
 
   return {
     plugins: [react()],
@@ -21,6 +24,14 @@ export default defineConfig(({ mode }) => {
         '/api': {
           target: backendUrl,
           changeOrigin: true,
+          configure: (proxy) => {
+            // This is a same-origin browser request terminated by Vite. Forwarding
+            // the browser's LAN Origin makes Spring treat the internal hop as a
+            // cross-origin request and ties the deployment to a changing host IP.
+            proxy.on('proxyReq', (proxyRequest) => {
+              proxyRequest.removeHeader('origin')
+            })
+          },
         },
       },
     },

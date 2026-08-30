@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import uuid
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
@@ -23,6 +25,9 @@ from backend.result_formatter import format_result
 from backend.schemas import ErrorResponse, HealthResponse, ModelSearchRequest, ModelSearchResponse, TaskProgress, TaskStage
 
 
+log = logging.getLogger(__name__)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     engine = create_engine(settings)
@@ -30,6 +35,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if settings.preload_models:
+            log.info("Preloading PaSa crawler and selector models")
+            await asyncio.to_thread(engine.preload)
+            log.info("PaSa model preload completed")
         yield
 
     app = FastAPI(
@@ -99,7 +108,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except EngineError as exc:
                 raise ApiError(502, exc.code, "PaSa 论文检索执行失败") from exc
             result = format_result(payload.request_id, payload.query, tree)
-            return result.model_copy(update={"analysis": engine.analyze(payload, result)})
+            result = result.model_copy(update={"analysis": engine.analyze(payload, result)})
+            return result.model_copy(update={"metrics": engine.metrics()})
         finally:
             inference_slots.release()
 
@@ -139,6 +149,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     papers_selected=result.summary.selected_count,
                 ))
                 result = result.model_copy(update={"analysis": engine.analyze(payload, result)})
+                result = result.model_copy(update={"metrics": engine.metrics()})
                 events.put({"type": "result", "data": result.model_dump(mode="json")})
             except ModelUnavailableError as exc:
                 events.put({"type": "error", "error": {
@@ -147,12 +158,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "details": None,
                 }})
             except EngineError as exc:
+                log.exception("Search engine failed for request %s", payload.request_id)
                 events.put({"type": "error", "error": {
                     "code": exc.code,
                     "message": "PaSa 论文检索执行失败",
                     "details": None,
                 }})
             except Exception:
+                log.exception("Unhandled model-service failure for request %s", payload.request_id)
                 events.put({"type": "error", "error": {
                     "code": "INTERNAL_ERROR",
                     "message": "模型服务内部错误",

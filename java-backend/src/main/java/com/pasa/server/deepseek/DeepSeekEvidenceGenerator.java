@@ -1,6 +1,7 @@
 package com.pasa.server.deepseek;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.pasa.server.api.ApiModels;
 import com.pasa.server.config.PasaProperties;
@@ -24,8 +25,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -45,6 +44,7 @@ public class DeepSeekEvidenceGenerator {
                     + "lack(?:s|ing)? .{0,32}(?:information|details|evidence))");
     private static final Pattern CONTRAST_TRANSITION = Pattern.compile(
             "(?i)(?:[；;，,]\s*)?(?:然而|但是|但|不过|可是|although|however|but)\s*[，,]?");
+    private static final Pattern CHINESE_CHARACTER = Pattern.compile("[\\u3400-\\u9fff]");
 
     private final DeepSeekEvidenceClient client;
     private final PasaProperties properties;
@@ -95,22 +95,32 @@ public class DeepSeekEvidenceGenerator {
         }
 
         Map<String, Outcome> outcomes = new HashMap<>();
-        int concurrency = Math.min(properties.getDeepseekConcurrency(), targets.size());
-        try (var executor = Executors.newFixedThreadPool(concurrency,
-                Thread.ofVirtual().name("pasa-deepseek-evidence-", 0).factory())) {
-            Map<String, Future<Outcome>> futures = new LinkedHashMap<>();
-            for (ApiModels.PaperItem paper : targets) {
-                futures.put(paper.paperId(), executor.submit(() -> analyze(originalQuery, constraints, paper)));
+        List<ApiModels.PaperItem> uncached = new ArrayList<>();
+        for (ApiModels.PaperItem paper : targets) {
+            ApiModels.DeepSeekTrace trace = cache.get(cacheKey(
+                    originalQuery, paper.paperId(), properties.getDeepseekPromptVersion()));
+            if (trace == null) {
+                uncached.add(paper);
+            } else {
+                outcomes.put(paper.paperId(), new Outcome("success", trace,
+                        0, 0, 0, 0, true, properties.getDeepseekModel()));
             }
-            futures.forEach((paperId, future) -> {
-                try {
-                    outcomes.put(paperId, future.get());
-                } catch (Exception exception) {
-                    log.warn("DeepSeek evidence task failed for paper {}: {}", paperId,
-                            exception.getClass().getSimpleName());
-                    outcomes.put(paperId, Outcome.degraded(properties.getDeepseekModel(), 0));
-                }
-            });
+        }
+
+        long batchCalls = 0;
+        long batchInputTokens = 0;
+        long batchOutputTokens = 0;
+        String batchModel = properties.getDeepseekModel();
+        if (uncached.size() == 1) {
+            ApiModels.PaperItem paper = uncached.getFirst();
+            outcomes.put(paper.paperId(), analyze(originalQuery, constraints, paper));
+        } else if (!uncached.isEmpty()) {
+            BatchAnalysis analysis = analyzeBatch(originalQuery, constraints, uncached);
+            outcomes.putAll(analysis.outcomes());
+            batchCalls = analysis.calls();
+            batchInputTokens = analysis.inputTokens();
+            batchOutputTokens = analysis.outputTokens();
+            batchModel = analysis.modelName();
         }
 
         List<ApiModels.PaperItem> result = papers.stream().map(paper -> {
@@ -119,14 +129,14 @@ public class DeepSeekEvidenceGenerator {
                     ? withTrace(paper, "disabled", null)
                     : withTrace(paper, outcome.status(), outcome.trace());
         }).toList();
-        long calls = outcomes.values().stream().mapToLong(Outcome::calls).sum();
-        long inputTokens = outcomes.values().stream().mapToLong(Outcome::inputTokens).sum();
-        long outputTokens = outcomes.values().stream().mapToLong(Outcome::outputTokens).sum();
+        long calls = batchCalls + outcomes.values().stream().mapToLong(Outcome::calls).sum();
+        long inputTokens = batchInputTokens + outcomes.values().stream().mapToLong(Outcome::inputTokens).sum();
+        long outputTokens = batchOutputTokens + outcomes.values().stream().mapToLong(Outcome::outputTokens).sum();
         long cacheHits = outcomes.values().stream().filter(Outcome::cacheHit).count();
         long degraded = outcomes.values().stream().filter(value -> "degraded".equals(value.status())).count();
         String modelName = outcomes.values().stream().map(Outcome::modelName)
                 .filter(value -> value != null && !value.isBlank()).findFirst()
-                .orElse(properties.getDeepseekModel());
+                .orElse(batchModel);
         return new BatchResult(result, new ApiModels.DeepSeekUsageStats(
                 calls, inputTokens, outputTokens, cacheHits, degraded, modelName));
     }
@@ -138,6 +148,14 @@ public class DeepSeekEvidenceGenerator {
                 .toList();
         return new BatchResult(result, new ApiModels.DeepSeekUsageStats(
                 0, 0, 0, 0, degraded, properties.getDeepseekModel()));
+    }
+
+    public BatchResult disabled(List<ApiModels.PaperItem> papers) {
+        List<ApiModels.PaperItem> result = papers.stream()
+                .map(paper -> withTrace(paper, "disabled", null))
+                .toList();
+        return new BatchResult(result, new ApiModels.DeepSeekUsageStats(
+                0, 0, 0, 0, 0, properties.getDeepseekModel()));
     }
 
     private boolean available() {
@@ -212,6 +230,98 @@ public class DeepSeekEvidenceGenerator {
         return Outcome.degraded(properties.getDeepseekModel(), properties.getDeepseekMaxRetries());
     }
 
+    /**
+     * Audits all uncached recommendation papers in one API request. Besides reducing cost and
+     * latency, paper_id keeps every response independently verifiable: one malformed trace is
+     * degraded without discarding valid traces returned in the same batch.
+     */
+    private BatchAnalysis analyzeBatch(
+            String originalQuery,
+            List<ApiModels.QueryConstraint> constraints,
+            List<ApiModels.PaperItem> papers
+    ) {
+        String userPrompt = buildBatchUserPrompt(originalQuery, constraints, papers);
+        int maxAttempts = Math.min(2, properties.getDeepseekMaxRetries() + 1);
+        long inputTokens = 0;
+        long outputTokens = 0;
+        Instant started = Instant.now();
+        String modelName = properties.getDeepseekModel();
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                DeepSeekEvidenceClient.Completion completion;
+                apiSlots.acquire();
+                try {
+                    completion = client.complete(systemPrompt, userPrompt);
+                } finally {
+                    apiSlots.release();
+                }
+                inputTokens += completion.inputTokens();
+                outputTokens += completion.outputTokens();
+                modelName = completion.modelName();
+                JsonNode root = objectMapper.readTree(completion.content());
+                JsonNode analyses = root.path("analyses");
+                if (!analyses.isArray()) {
+                    throw new IllegalArgumentException("batch response must contain analyses array");
+                }
+                Map<String, JsonNode> returned = new HashMap<>();
+                for (JsonNode item : analyses) {
+                    String paperId = item.path("paper_id").asText("");
+                    if (!paperId.isBlank() && !returned.containsKey(paperId)) {
+                        returned.put(paperId, item.path("trace"));
+                    }
+                }
+                Map<String, Outcome> outcomes = new LinkedHashMap<>();
+                Set<String> seenRecommendations = new HashSet<>();
+                for (ApiModels.PaperItem paper : papers) {
+                    try {
+                        JsonNode traceNode = returned.get(paper.paperId());
+                        if (traceNode == null || traceNode.isMissingNode() || traceNode.isNull()) {
+                            throw new IllegalArgumentException("missing trace for paper " + paper.paperId());
+                        }
+                        ApiModels.DeepSeekTrace raw = objectMapper.treeToValue(
+                                traceNode, ApiModels.DeepSeekTrace.class);
+                        ApiModels.DeepSeekTrace validated = validate(raw, constraints, paper);
+                        String recommendationKey = validated.recommendationReason()
+                                .replaceAll("[\\p{Punct}\\p{IsPunctuation}\\s]+", "")
+                                .toLowerCase();
+                        if (!seenRecommendations.add(recommendationKey)) {
+                            throw new IllegalArgumentException(
+                                    "duplicate recommendation_reason across papers");
+                        }
+                        putCache(cacheKey(originalQuery, paper.paperId(),
+                                properties.getDeepseekPromptVersion()), validated);
+                        outcomes.put(paper.paperId(), new Outcome("success", validated,
+                                0, 0, 0, attempt - 1, false, modelName));
+                    } catch (Exception exception) {
+                        log.warn("DeepSeek batch trace degraded paper={} cause={}", paper.paperId(),
+                                exception.getClass().getSimpleName());
+                        outcomes.put(paper.paperId(), new Outcome("degraded", null,
+                                0, 0, 0, attempt - 1, false, modelName));
+                    }
+                }
+                long latency = Duration.between(started, Instant.now()).toMillis();
+                log.info("DeepSeek evidence batch papers={} model={} input_tokens={} output_tokens={} latency_ms={} retries={}",
+                        papers.size(), modelName, inputTokens, outputTokens, latency, attempt - 1);
+                return new BatchAnalysis(outcomes, attempt, inputTokens, outputTokens, modelName);
+            } catch (Exception exception) {
+                if (exception instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                if (attempt == maxAttempts) {
+                    log.warn("DeepSeek evidence batch degraded papers={} retries={} cause={}",
+                            papers.size(), attempt - 1, exception.getClass().getSimpleName());
+                    Map<String, Outcome> degraded = new LinkedHashMap<>();
+                    for (ApiModels.PaperItem paper : papers) {
+                        degraded.put(paper.paperId(), new Outcome("degraded", null,
+                                0, 0, 0, attempt - 1, false, modelName));
+                    }
+                    return new BatchAnalysis(degraded, attempt, inputTokens, outputTokens, modelName);
+                }
+            }
+        }
+        throw new IllegalStateException("unreachable DeepSeek batch state");
+    }
+
     private String buildUserPrompt(
             String originalQuery,
             List<ApiModels.QueryConstraint> constraints,
@@ -254,6 +364,64 @@ public class DeepSeekEvidenceGenerator {
         } catch (Exception exception) {
             throw new IllegalStateException("Cannot serialize DeepSeek evidence prompt", exception);
         }
+    }
+
+    private String buildBatchUserPrompt(
+            String originalQuery,
+            List<ApiModels.QueryConstraint> constraints,
+            List<ApiModels.PaperItem> papers
+    ) {
+        try {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("original_query", originalQuery);
+            payload.put("constraints", constraintPayload(constraints));
+            payload.put("papers", papers.stream().map(this::paperPayload).toList());
+            return "Audit every paper independently. Return one JSON object exactly in the form "
+                    + "{\"analyses\":[{\"paper_id\":\"the input paper_id\",\"trace\":"
+                    + "<an evidence-v2 object matching the system schema>}]}。"
+                    + "Return exactly one analyses entry per input paper and never mix evidence between papers. "
+                    + "Every recommendation_reason must describe that paper's own task, concrete method or "
+                    + "finding, and its specific value for the query in natural Simplified Chinese; do not reuse "
+                    + "sentence templates across papers.\n"
+                    + objectMapper.writeValueAsString(payload);
+        } catch (Exception exception) {
+            throw new IllegalStateException("Cannot serialize DeepSeek batch prompt", exception);
+        }
+    }
+
+    private List<Map<String, Object>> constraintPayload(List<ApiModels.QueryConstraint> constraints) {
+        return constraints.stream().map(constraint -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("constraint_id", constraint.constraintId());
+            value.put("type", constraint.type());
+            value.put("description", constraint.description());
+            value.put("importance", constraint.importance());
+            value.put("original_text", constraint.originalText());
+            return value;
+        }).toList();
+    }
+
+    private Map<String, Object> paperPayload(ApiModels.PaperItem paper) {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("publication_year", paper.publicationYear());
+        metadata.put("publication_date", paper.publicationDate());
+        metadata.put("authors", safe(paper.authors()));
+        metadata.put("venue", paper.venue());
+        metadata.put("cited_by_count", paper.citedByCount());
+        metadata.put("doi", paper.doi());
+        Map<String, Object> selector = new LinkedHashMap<>();
+        selector.put("decision", paper.selected() ? "selected" : "dropped");
+        selector.put("score", paper.selectorScore() == null ? paper.score() : paper.selectorScore());
+        selector.put("reason", paper.selectorReason());
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("paper_id", paper.paperId());
+        value.put("title", text(paper.title()));
+        value.put("abstract", text(paper.abstractText()));
+        value.put("metadata", metadata);
+        value.put("selector", selector);
+        value.put("fulltext_excerpts", List.of());
+        value.put("citations", List.of());
+        return value;
     }
 
     ApiModels.DeepSeekTrace validate(
@@ -309,6 +477,11 @@ public class DeepSeekEvidenceGenerator {
             if ("unknown".equals(status)) {
                 ids = List.of();
             }
+            if (!hasSubstantialChinese(explanation)) {
+                explanation = "unknown".equals(status)
+                        ? "现有标题与摘要证据不足，暂不判断该条件。"
+                        : "该条件判断由下方可核验的论文原文证据支持。";
+            }
             byConstraint.put(result.constraintId(), new ApiModels.DeepSeekConstraintResult(
                     result.constraintId(), status, explanation, ids, clamp(result.confidence())));
         }
@@ -321,6 +494,9 @@ public class DeepSeekEvidenceGenerator {
         // Unknown constraints remain available below as structured results, but repetitive absence
         // disclaimers add no value to the natural recommendation paragraph.
         String reason = usefulRecommendationReason(raw.recommendationReason(), paper);
+        if (!isPersonalizedRecommendation(reason)) {
+            throw new IllegalArgumentException("recommendation_reason is not personalized Chinese analysis");
+        }
         return new ApiModels.DeepSeekTrace(
                 reason,
                 relevance,
@@ -357,9 +533,31 @@ public class DeepSeekEvidenceGenerator {
             }
         }
         if (!usefulSentences.isEmpty()) {
-            return String.join("", usefulSentences);
+            String result = String.join("", usefulSentences);
+            if (hasSubstantialChinese(result)) {
+                return result;
+            }
         }
-        return "《" + text(paper.title()).strip() + "》与本次检索主题的具体关联，见下方原文证据与约束判断。";
+        return "";
+    }
+
+    private static boolean isPersonalizedRecommendation(String value) {
+        String reason = text(value).strip();
+        if (!hasSubstantialChinese(reason) || chineseCharacterCount(reason) < 18) return false;
+        return !reason.contains("与本次检索主题的具体关联，见下方原文证据")
+                && !Set.of("与检索主题相关。", "具有参考价值。", "值得关注。")
+                .contains(reason);
+    }
+
+    private static boolean hasSubstantialChinese(String value) {
+        return chineseCharacterCount(value) >= 4;
+    }
+
+    private static int chineseCharacterCount(String value) {
+        Matcher matcher = CHINESE_CHARACTER.matcher(text(value));
+        int count = 0;
+        while (matcher.find()) count++;
+        return count;
     }
 
     private boolean validEvidence(
@@ -471,6 +669,14 @@ public class DeepSeekEvidenceGenerator {
     }
 
     public record BatchResult(List<ApiModels.PaperItem> papers, ApiModels.DeepSeekUsageStats usage) {}
+
+    private record BatchAnalysis(
+            Map<String, Outcome> outcomes,
+            long calls,
+            long inputTokens,
+            long outputTokens,
+            String modelName
+    ) {}
 
     private record Outcome(
             String status,

@@ -146,6 +146,26 @@ class SearchTaskServiceTest {
     }
 
     @Test
+    void skipsPaidRecommendationAnalysisWhenRequestDisablesIt() {
+        ApiModels.PaperItem paper = new ApiModels.PaperItem(
+                "arxiv:2501.00001", "2501.00001", null, null,
+                "Paper", "Abstract", 0.9, true, 0,
+                "SearchFrom:mock", "https://arxiv.org/abs/2501.00001",
+                "https://arxiv.org/abs/2501.00001", 2025, null,
+                null, 0, List.of(), List.of("mock"));
+        SearchTaskService service = new SearchTaskService(
+                successfulGateway(paper), Runnable::run, passThroughTraceability(), enabledFailingDeepSeek());
+
+        ApiModels.TaskAccepted accepted = service.create(new ApiModels.CreateSearchTaskRequest(
+                "find papers", null, new ApiModels.SearchOptions(0, 5, 10, 10, false)));
+        ApiModels.TaskResult result = service.result(accepted.taskId());
+
+        assertThat(result.deepseekUsage().totalCalls()).isZero();
+        assertThat(result.deepseekUsage().inputTokens()).isZero();
+        assertThat(result.papers().getFirst().traceStatus()).isEqualTo("disabled");
+    }
+
+    @Test
     void exposesModelProgressWhileSearchIsRunning() throws Exception {
         CountDownLatch progressSent = new CountDownLatch(1);
         CountDownLatch allowResult = new CountDownLatch(1);
@@ -190,7 +210,7 @@ class SearchTaskServiceTest {
         try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
             SearchTaskService service = new SearchTaskService(gateway, executor, passThroughTraceability(), disabledDeepSeek());
             ApiModels.TaskAccepted accepted = service.create(new ApiModels.CreateSearchTaskRequest(
-                    "find papers", null, new ApiModels.SearchOptions(2, 5, 10, 20)));
+                    "find papers", null, new ApiModels.SearchOptions(2, 5, 10, 20, false)));
 
             assertThat(progressSent.await(5, TimeUnit.SECONDS)).isTrue();
             ApiModels.TaskView running = service.get(accepted.taskId());
@@ -223,6 +243,17 @@ class SearchTaskServiceTest {
         properties.setDeepseekEvidenceEnabled(false);
         DeepSeekEvidenceClient client = (system, user) -> {
             throw new AssertionError("disabled DeepSeek client must not be called");
+        };
+        return new DeepSeekEvidenceGenerator(client, properties, new ObjectMapper());
+    }
+
+    private static DeepSeekEvidenceGenerator enabledFailingDeepSeek() {
+        PasaProperties properties = new PasaProperties();
+        properties.setDeepseekEvidenceEnabled(true);
+        properties.setDeepseekApiKey("test-key");
+        properties.setDeepseekMaxPapers(6);
+        DeepSeekEvidenceClient client = (system, user) -> {
+            throw new AssertionError("request-level cost control must skip DeepSeek");
         };
         return new DeepSeekEvidenceGenerator(client, properties, new ObjectMapper());
     }

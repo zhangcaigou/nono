@@ -28,7 +28,7 @@ public class PasaProperties {
     private boolean deepseekEvidenceEnabled = true;
     private int deepseekTimeout = 60;
     private int deepseekMaxRetries = 2;
-    private int deepseekMaxPapers = 20;
+    private int deepseekMaxPapers = 6;
     private boolean deepseekFulltextEnabled = false;
     private int deepseekConcurrency = 4;
     private int deepseekCacheMaxEntries = 1000;

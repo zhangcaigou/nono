@@ -23,11 +23,17 @@ public final class ModelModels {
             List<ApiModels.PaperItem> papers,
             JsonNode tree,
             ApiModels.ResultSummary summary,
-            JsonNode analysis
+            JsonNode analysis,
+            JsonNode metrics
     ) {
         public ModelSearchResponse(String requestId, String query, List<ApiModels.PaperItem> papers,
+                                   JsonNode tree, ApiModels.ResultSummary summary, JsonNode analysis) {
+            this(requestId, query, papers, tree, summary, analysis, null);
+        }
+
+        public ModelSearchResponse(String requestId, String query, List<ApiModels.PaperItem> papers,
                                    JsonNode tree, ApiModels.ResultSummary summary) {
-            this(requestId, query, papers, tree, summary, null);
+            this(requestId, query, papers, tree, summary, null, null);
         }
     }
 

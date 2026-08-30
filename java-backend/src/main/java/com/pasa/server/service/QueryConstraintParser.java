@@ -1,5 +1,6 @@
 package com.pasa.server.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.pasa.server.api.ApiModels;
 import org.springframework.stereotype.Component;
 
@@ -59,6 +60,69 @@ public class QueryConstraintParser {
         return List.copyOf(constraints);
     }
 
+    public List<ApiModels.QueryConstraint> parseAnalysis(
+            JsonNode analysis,
+            String query,
+            LocalDate endDate
+    ) {
+        JsonNode understanding = analysis == null ? null : analysis.path("query_understanding");
+        if (understanding == null || !understanding.isObject() || understanding.isEmpty()) {
+            return parse(query, endDate);
+        }
+
+        List<ConstraintValue> values = new ArrayList<>();
+        addValue(values, "hard", understanding.path("research_intent").asText(""), query);
+        addArray(values, "hard", understanding.path("hard_constraints"), query);
+        addArray(values, "soft", understanding.path("soft_constraints"), query);
+        addArray(values, "exclusion", understanding.path("exclusions"), query);
+        if (OUTPUT.matcher(query).find()) {
+            addArray(values, "output", understanding.path("comparison_dimensions"), query);
+        }
+
+        Set<String> seen = new LinkedHashSet<>();
+        List<ApiModels.QueryConstraint> constraints = new ArrayList<>();
+        int index = 1;
+        for (ConstraintValue value : values) {
+            String key = value.type() + ":" + value.description().toLowerCase(Locale.ROOT)
+                    .replaceAll("[\\s，。；;,.]+", "");
+            if (!value.description().isBlank() && seen.add(key)) {
+                constraints.add(constraint(index++, value.type(), value.description(), value.originalText()));
+            }
+        }
+        if (constraints.isEmpty()) {
+            return parse(query, endDate);
+        }
+        if (endDate != null && constraints.stream().noneMatch(item -> containsDate(item.text(), endDate))) {
+            String text = "发表日期不晚于 " + endDate;
+            constraints.add(constraint(index, "hard", text, text));
+        }
+        return List.copyOf(constraints);
+    }
+
+    private static void addArray(
+            List<ConstraintValue> target,
+            String type,
+            JsonNode values,
+            String originalText
+    ) {
+        if (values == null || !values.isArray()) {
+            return;
+        }
+        values.forEach(value -> addValue(target, type, value.asText(""), originalText));
+    }
+
+    private static void addValue(
+            List<ConstraintValue> target,
+            String type,
+            String description,
+            String originalText
+    ) {
+        String cleaned = description == null ? "" : description.strip();
+        if (!cleaned.isBlank()) {
+            target.add(new ConstraintValue(type, cleaned, originalText));
+        }
+    }
+
     private static ApiModels.QueryConstraint constraint(int index, String importance, String description,
                                                          String originalText) {
         return new ApiModels.QueryConstraint("C" + index, importance, description,
@@ -96,4 +160,6 @@ public class QueryConstraintParser {
         String lower = text.toLowerCase(Locale.ROOT);
         return lower.contains(date.toString()) || lower.contains(Integer.toString(date.getYear()));
     }
+
+    private record ConstraintValue(String type, String description, String originalText) {}
 }

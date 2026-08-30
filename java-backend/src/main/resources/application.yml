@@ -40,7 +40,7 @@ pasa:
   deepseek-evidence-enabled: ${DEEPSEEK_EVIDENCE_ENABLED:true}
   deepseek-timeout: ${DEEPSEEK_TIMEOUT:60}
   deepseek-max-retries: ${DEEPSEEK_MAX_RETRIES:2}
-  deepseek-max-papers: ${DEEPSEEK_MAX_PAPERS:20}
+  deepseek-max-papers: ${DEEPSEEK_MAX_PAPERS:6}
   deepseek-fulltext-enabled: ${DEEPSEEK_FULLTEXT_ENABLED:false}
   deepseek-concurrency: ${DEEPSEEK_CONCURRENCY:4}
   deepseek-cache-max-entries: ${DEEPSEEK_CACHE_MAX_ENTRIES:1000}
